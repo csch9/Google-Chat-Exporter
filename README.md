@@ -5,10 +5,11 @@
 [![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/vishwas-r/google-chat-exporter/graphs/commit-activity)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/vishwas-r/google-chat-exporter/pulls)
 [![Chrome Web Store](https://img.shields.io/badge/Chrome%20Extension-Available-blue.svg)](https://chromewebstore.google.com/detail/google-chat-exporter/epemodmmmilflmhgojgonhfcjfjnflgc)
+[![Firefox Add-on](https://img.shields.io/badge/Firefox%20Add--on-Available-orange.svg)](https://addons.mozilla.org/en-US/firefox/addon/google-chat-exporter/)
 
 The ultimate, privacy-first browser extension for exporting Google Chat conversations to **Plain Text (TXT)** or **rich HTML with full media attachments (packaged in a ZIP)**.
 
-Works across **Google Chrome, Brave, Microsoft Edge**, standalone PWA windows, and Gmail-embedded Chat.
+Works across **Google Chrome, Mozilla Firefox, Brave, Microsoft Edge**, standalone PWA windows, and Gmail-embedded Chat.
 
 ---
 
@@ -46,9 +47,13 @@ Works across **Google Chrome, Brave, Microsoft Edge**, standalone PWA windows, a
 
 ## 📥 Installation
 
-### From Chrome Web Store
-Install directly from the official store:  
-👉 **[Google Chat Exporter on Chrome Web Store](https://chromewebstore.google.com/detail/google-chat-exporter/epemodmmmilflmhgojgonhfcjfjnflgc)**
+### Official Web Stores
+Install directly from your browser's official store:
+
+- 🌐 **Google Chrome, Brave, Microsoft Edge**:  
+  👉 **[Google Chat Exporter on Chrome Web Store](https://chromewebstore.google.com/detail/google-chat-exporter/epemodmmmilflmhgojgonhfcjfjnflgc)**
+- 🦊 **Mozilla Firefox (Desktop & Android)**:  
+  👉 **[Google Chat Exporter on Firefox Add-ons (AMO)](https://addons.mozilla.org/en-US/firefox/addon/google-chat-exporter/)**
 
 ### Manual Installation (Developer Mode)
 
