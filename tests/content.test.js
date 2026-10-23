@@ -101,12 +101,34 @@ test('virtualized history visits overlapping windows, deduplicates, and complete
   const waits = [];
   c.waitForHistoryMutation = async (_el, _height, _oldest, timeout) => { waits.push(timeout); };
   c.sleep = async () => {};
+  c.provokeHistoryLoad = async () => false;
   const result = await c.scrollToLoadAll();
   assert.deepEqual(Array.from(result.messages, m => m.text), Array.from({ length: 12 }, (_, i) => String(i)));
   assert.equal(result.reason, 'idle');
   assert.equal(result.warning, '');
-  assert.deepEqual(waits.slice(-3), [600, 1200, 1800], 'final idle checks total 3.6 seconds');
+  assert.deepEqual(waits.slice(-8), [600, 1200, 1800, 2400, 3000, 3600, 4000, 4000], 'final idle checks back off to a 4 second cap');
   assert.equal(container.scrollTop, 800);
+});
+
+test('stalled top nudges the scroll position and unchanged DOM is not re-collected', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 0,
+    getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+  c.findScrollContainer = () => container;
+  let extractions = 0;
+  c.extractMessages = () => { extractions++; return [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }]; };
+  c.getOldestTimestamp = () => 1;
+  c.waitForHistoryMutation = async () => {};
+  c.sleep = async () => {};
+  const tops = [];
+  let top = 0;
+  Object.defineProperty(container, 'scrollTop', { get: () => top, set: value => { tops.push(value); top = value; } });
+  const result = await c.scrollToLoadAll();
+  assert.equal(result.reason, 'idle');
+  assert.ok(tops.includes(100), 'first retries nudge the scroll position');
+  assert.ok(tops.includes(1200), 'later retries move away and walk back up to the top');
+  assert.equal(extractions, 2, 'only the initial and final collections scan an unchanged DOM');
 });
 
 test('cancel during history restores position and disconnects its observer', async () => {

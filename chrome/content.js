@@ -281,8 +281,9 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     let prevOldest = getOldestTimestamp();
     let stableBatches = 0;
     let batches = 0;
-    const MAX_BATCHES = 3000;
-    const STABLE_BATCH_LIMIT = 3;
+    const MAX_BATCHES = 50000;
+    const STABLE_BATCH_LIMIT = 8;
+    let walkingBack = false;
 
     onProgress && onProgress('Scrolling up to load full history...');
 
@@ -304,8 +305,12 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
       const beforeCount = dedupMap.size;
       const previousTop = container.scrollTop;
       const targetTop = Math.max(0, previousTop - Math.max(1, container.clientHeight * 0.75));
+      if (targetTop <= 1 && previousTop <= 1 && stableBatches > 0) {
+        if (walkingBack) walkingBack = false;
+        else if (await provokeHistoryLoad(container, stableBatches, signal)) { walkingBack = true; continue; }
+      }
       const wait = waitForHistoryMutation(container, prevHeight, prevOldest,
-        targetTop > 1 ? 250 : 600 * (stableBatches + 1), signal, targetTop > 1);
+        targetTop > 1 ? 250 : Math.min(600 * (stableBatches + 1), 4000), signal, targetTop > 1);
       container.scrollTop = targetTop;
       await wait;
       collectCurrent();
@@ -316,6 +321,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
 
       if (advanced) {
         stableBatches = 0;
+        walkingBack = false;
         prevHeight = curHeight;
         prevOldest = oldest;
       } else if (container.scrollTop <= 1 && previousTop <= 1) {
@@ -329,6 +335,11 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     }
 
     collectCurrent(true);
+    console.info('[Google Chat Exporter] history scan finished', {
+      reason, batches, messages: dedupMap.size, stableBatches,
+      scrollTop: container.scrollTop, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight,
+      groups: document.querySelectorAll(SEL.messageGroups).length
+    });
     const warning = reason === 'date-boundary' ? '' : reason === 'limit'
       ? 'History scan reached its safety limit; export may be incomplete.'
       : '';
@@ -341,6 +352,20 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     extractionCache.disconnect();
     restoreScrollPosition(container, distanceFromBottom, anchor);
   }
+}
+
+// Chat fetches older history on scroll input, so a scrollTop pinned at 0 never triggers it; vary the trigger per retry.
+// Returns true when it moved far from the top so the caller can scroll back up like a user would.
+async function provokeHistoryLoad(container, attempt, signal) {
+  if (attempt === 2 && typeof WheelEvent === 'function') {
+    container.dispatchEvent?.(new WheelEvent('wheel', { deltaY: -300, bubbles: true, cancelable: true }));
+  } else if (attempt === 3) {
+    container.querySelector?.(SEL.messageGroups)?.scrollIntoView?.({ block: 'start' });
+  }
+  const farJump = attempt >= 4;
+  container.scrollTop = Math.min(container.clientHeight * (farJump ? 6 : 0.25), container.scrollHeight);
+  await sleep(60, signal);
+  return farJump;
 }
 
 function captureScrollAnchor(container) {
