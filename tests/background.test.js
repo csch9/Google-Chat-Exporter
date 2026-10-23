@@ -117,6 +117,26 @@ test('background cancellation aborts the matching request and prevents retries',
   assert.equal(vm.runInContext('mediaRequests.size', c), 0);
 });
 
+test('staged export chunks are merged into one package and cleared afterwards', async () => {
+  const c = loadBackground();
+  let download;
+  c.chrome.downloads.download = (options, callback) => { download = options; callback(1); };
+  const listener = c.chrome.runtime.onMessage.listener;
+  const sender = { tab: { id: 5 }, frameId: 0 };
+  const send = msg => new Promise(resolve => { if (!listener(msg, sender, resolve)) resolve(); });
+  await send({ action: 'stagePackageParts', stageId: 's1', messages: [{ sender: 'A', timestamp: '1', text: 'one', media: [] }] });
+  await send({ action: 'stagePackageParts', stageId: 's1', messages: [{ sender: 'B', timestamp: '2', text: 'two', media: [] }] });
+  const payload = { conversationName: 'Fixture', exportDate: new Date().toISOString(), history: { reason: 'idle' } };
+  const response = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's1', payload });
+  assert.equal(response.success, true);
+  const text = Buffer.from(download.url.split(',')[1], 'base64').toString();
+  assert.match(text, /one/);
+  assert.match(text, /two/);
+  assert.equal(vm.runInContext('stagedPackages.size', c), 0);
+  const lost = await send({ action: 'packageAndDownload', format: 'txt', stageId: 'missing', payload });
+  assert.equal(lost.success, false);
+});
+
 test('saved TXT and HTML carry incomplete-history warnings', async () => {
   const c = loadBackground();
   let download;

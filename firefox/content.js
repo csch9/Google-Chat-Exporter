@@ -1115,6 +1115,31 @@ function isSameConversationUrl(a, b) {
 }
 
 // Resolves to 'done', 'empty', 'error', 'cancelled' or 'busy'.
+// A single runtime message is capped at 64 MiB, so large exports are staged in the background in chunks.
+async function sendPackage(format, payload) {
+  const stageId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const { messages, mediaFiles, ...rest } = payload;
+  const stage = async part => {
+    const resp = await chrome.runtime.sendMessage({ action: 'stagePackageParts', stageId, ...part });
+    if (resp && resp.success === false) throw new Error(resp.error || 'Could not stage export data.');
+  };
+  try {
+    for (let i = 0; i < messages.length; i += 500) await stage({ messages: messages.slice(i, i + 500) });
+    let batch = [];
+    let size = 0;
+    for (const file of mediaFiles) {
+      batch.push(file);
+      size += file.base64.length;
+      if (size >= 16_000_000) { await stage({ mediaFiles: batch }); batch = []; size = 0; }
+    }
+    if (batch.length) await stage({ mediaFiles: batch });
+    return await chrome.runtime.sendMessage({ action: 'packageAndDownload', format, stageId, payload: rest });
+  } catch (error) {
+    try { await chrome.runtime.sendMessage({ action: 'discardStagedPackage', stageId }); } catch { /* worker may be gone */ }
+    throw error;
+  }
+}
+
 async function runExport({ format = 'txt', loadAll = true, includeMedia = true, dateFrom = '', incremental = false, sourceUrl = '', auto = false }) {
   if (exportInProgress) return 'busy';
   exportInProgress = true;
@@ -1251,11 +1276,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     exportController = null;
 
     // Send to background for packaging & download
-    const resp = await chrome.runtime.sendMessage({
-      action: 'packageAndDownload',
-      format,
-      payload: { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: { reason: history.reason, warning: history.warning, since: history.since }, checkpoint: candidate ? { key: checkpointKey, value: candidate } : null }
-    });
+    const resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: { reason: history.reason, warning: history.warning, since: history.since }, checkpoint: candidate ? { key: checkpointKey, value: candidate } : null });
       if (resp && resp.success) {
         const next = auto ? ' Auto-export: open the next channel.' : '';
         showProgress(`Saved as ${resp.filename}. ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');

@@ -7,6 +7,8 @@ if (typeof importScripts === 'function' && typeof JSZip === 'undefined') {
   importScripts('lib/jszip.min.js');
 }
 const mediaRequests = new Map();
+// Export data arrives in chunks because one runtime message is capped at 64 MiB.
+const stagedPackages = new Map();
 // Persist pending download/checkpoint associations so worker suspension is safe.
 let checkpointQueue = Promise.resolve();
 function serializeCheckpoint(work) {
@@ -208,28 +210,53 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // keep channel open
   }
 
+  if (msg.action === 'stagePackageParts') {
+    const key = mediaRequestKey(sender, msg.stageId);
+    const staged = stagedPackages.get(key) || { messages: [], mediaFiles: [] };
+    for (const item of msg.messages || []) staged.messages.push(item);
+    for (const item of msg.mediaFiles || []) staged.mediaFiles.push(item);
+    stagedPackages.set(key, staged);
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (msg.action === 'discardStagedPackage') {
+    stagedPackages.delete(mediaRequestKey(sender, msg.stageId));
+    sendResponse({ success: true });
+    return false;
+  }
+
   if (msg.action === 'packageAndDownload') {
     // Content script sends extracted data here for packaging
     (async () => {
+      const stageKey = mediaRequestKey(sender, msg.stageId);
       try {
-        if (msg.payload.sourceUrl && sender.tab?.id) {
+        let payload = msg.payload;
+        if (msg.stageId) {
+          const staged = stagedPackages.get(stageKey);
+          if (!staged) throw new Error('Export data was lost before packaging. Please retry.');
+          payload = { ...msg.payload, messages: staged.messages, mediaFiles: staged.mediaFiles };
+        }
+        if (payload.sourceUrl && sender.tab?.id) {
           const tab = await chrome.tabs.get(sender.tab.id);
-          if (tab?.url && !isSameConversationUrl(msg.payload.sourceUrl, tab.url)) {
+          if (tab?.url && !isSameConversationUrl(payload.sourceUrl, tab.url)) {
             throw new Error('Conversation changed during export. Please retry.');
           }
         }
         const result = msg.format === 'html'
-          ? await packageHtml(msg.payload)
-          : await packageTxt(msg.payload);
+          ? await packageHtml(payload)
+          : await packageTxt(payload);
         let checkpointWarning = '';
-        if (msg.payload.checkpoint) {
-          try { await queueCheckpoint(result.downloadId, msg.payload.checkpoint); }
+        if (payload.checkpoint) {
+          try { await queueCheckpoint(result.downloadId, payload.checkpoint); }
           catch { checkpointWarning = 'Export downloaded, but its checkpoint could not be saved. Next export may repeat messages.'; }
         }
         sendResponse({ success: true, ...result, checkpointWarning });
       } catch (err) {
         console.error('[GCE BG] Package error:', err);
         sendResponse({ success: false, error: err.message });
+      } finally {
+        stagedPackages.delete(stageKey);
       }
     })();
     return true;

@@ -6,6 +6,20 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
+// Reassembles staged export chunks the way the background does, then hands the payload to onPackage.
+function packageRecorder(onPackage) {
+  const staged = { messages: [], mediaFiles: [] };
+  return async msg => {
+    if (msg.action === 'stagePackageParts') {
+      staged.messages.push(...(msg.messages || []));
+      staged.mediaFiles.push(...(msg.mediaFiles || []));
+      return { success: true };
+    }
+    if (msg.action !== 'packageAndDownload') return {};
+    return onPackage({ ...msg.payload, messages: staged.messages.splice(0), mediaFiles: staged.mediaFiles.splice(0) });
+  };
+}
+
 function loadContent() {
   const event = { addListener() {} };
   const selectors = {
@@ -129,6 +143,29 @@ test('stalled top nudges the scroll position and unchanged DOM is not re-collect
   assert.ok(tops.includes(100), 'first retries nudge the scroll position');
   assert.ok(tops.includes(1200), 'later retries move away and walk back up to the top');
   assert.equal(extractions, 2, 'only the initial and final collections scan an unchanged DOM');
+});
+
+test('large exports are staged in bounded chunks and discarded on failure', async () => {
+  const c = loadContent();
+  const sent = [];
+  c.chrome.runtime.sendMessage = async msg => { sent.push(msg); return msg.action === 'packageAndDownload' ? { success: false } : { success: true }; };
+  const messages = Array.from({ length: 1200 }, (_, i) => ({ text: String(i) }));
+  const mediaFiles = Array.from({ length: 3 }, (_, i) => ({ path: `m${i}`, base64: 'x'.repeat(10_000_000) }));
+  await c.sendPackage('html', { conversationName: 'x', messages, mediaFiles, history: {} });
+  const parts = sent.filter(m => m.action === 'stagePackageParts');
+  assert.deepEqual(parts.filter(m => m.messages).map(m => m.messages.length), [500, 500, 200]);
+  assert.deepEqual(parts.filter(m => m.mediaFiles).map(m => m.mediaFiles.length), [2, 1]);
+  const final = sent.at(-1);
+  assert.equal(final.action, 'packageAndDownload');
+  assert.equal(final.payload.messages, undefined, 'bulk data never rides on the final message');
+  sent.length = 0;
+  c.chrome.runtime.sendMessage = async msg => {
+    sent.push(msg.action);
+    if (msg.messages) throw new Error('boom');
+    return {};
+  };
+  await assert.rejects(c.sendPackage('txt', { messages: [{ text: 'a' }], mediaFiles: [], history: {} }), /boom/);
+  assert.deepEqual(sent, ['stagePackageParts', 'discardStagedPackage']);
 });
 
 test('cancel during history restores position and disconnects its observer', async () => {
@@ -387,11 +424,11 @@ test('incremental web-app export falls back to a content-derived checkpoint', as
   const stored = {};
   c.chrome.storage.local.get = async key => ({ [key]: stored[key] });
   let downloads = 0;
-  c.chrome.runtime.sendMessage = async msg => {
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
     downloads++;
-    stored[msg.payload.checkpoint.key] = msg.payload.checkpoint.value;
+    stored[payload.checkpoint.key] = payload.checkpoint.value;
     return { success: true, filename: 'pwa.txt' };
-  };
+  });
   const options = { format: 'txt', incremental: true, sourceUrl: 'https://chat.google.com/u/0/' };
   await c.runExport(options);
   await c.runExport(options);
@@ -415,11 +452,11 @@ test('incremental export establishes baseline, exports new files, then reports n
   const stored = {};
   c.chrome.storage.local.get = async key => ({ [key]: stored[key] });
   const packages = [];
-  c.chrome.runtime.sendMessage = async msg => {
-    packages.push(msg.payload);
-    if (msg.payload.checkpoint) stored[msg.payload.checkpoint.key] = msg.payload.checkpoint.value;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    packages.push(payload);
+    if (payload.checkpoint) stored[payload.checkpoint.key] = payload.checkpoint.value;
     return { success: true, filename: 'fixture.zip' };
-  };
+  });
   c.downloadMedia = async () => ({ success: true, base64: 'eA==', mimeType: 'text/plain' });
   const options = { format: 'html', includeMedia: true, incremental: true, sourceUrl: 'https://chat.google.com/u/0/app/chat/ABC' };
   await c.runExport(options);
