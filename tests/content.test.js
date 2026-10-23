@@ -84,6 +84,12 @@ test('already-aborted work fails before it starts', () => {
 test('virtualized history visits overlapping windows, deduplicates, and completes at idle', async () => {
   const c = loadContent();
   await c.loadSelectors();
+  // A virtualized list mutates the DOM on every scroll step.
+  c.MutationObserver = class {
+    observe() {}
+    disconnect() {}
+    takeRecords() { return [{ target: { nodeType: 1, closest: () => null } }]; }
+  };
   const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
     getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
   c.findScrollContainer = () => container;
@@ -107,7 +113,7 @@ test('cancel during history restores position and disconnects its observer', asy
   const c = loadContent();
   await c.loadSelectors();
   let disconnected = false;
-  c.MutationObserver = class { observe() {} disconnect() { disconnected = true; } };
+  c.MutationObserver = class { observe() {} disconnect() { disconnected = true; } takeRecords() { return []; } };
   const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
     getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
   c.findScrollContainer = () => container;

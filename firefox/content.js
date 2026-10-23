@@ -265,7 +265,10 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
   let reason = 'limit';
 
   const dedupMap = new Map();
-  const collectCurrent = () => {
+  const collectCurrent = (force = false) => {
+    // No DOM mutations since the last pass means extraction would return the same messages.
+    const hasChanges = extractionCache.changed();
+    if (!force && !hasChanges) return;
     for (const msg of extractMessages(extractionCache)) {
       const key = msg._dedupKey || `${msg.sender}|${msg.absoluteTimestamp}|${(msg.text || '').slice(0, 80)}`;
       dedupMap.set(key, msg);
@@ -273,7 +276,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
   };
 
   try {
-    collectCurrent();
+    collectCurrent(true);
     let prevHeight = container.scrollHeight;
     let prevOldest = getOldestTimestamp();
     let stableBatches = 0;
@@ -325,7 +328,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
       }
     }
 
-    collectCurrent();
+    collectCurrent(true);
     const warning = reason === 'date-boundary' ? '' : reason === 'limit'
       ? 'History scan reached its safety limit; export may be incomplete.'
       : '';
@@ -373,12 +376,15 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
     let settled = false;
     let settleTimer = 0;
     let timeoutTimer = 0;
+    let checkTimer = 0;
     let frame = null;
+    let framesDone = false;
 
     const cleanup = () => {
       observer.disconnect();
       clearTimeout(settleTimer);
       clearTimeout(timeoutTimer);
+      clearTimeout(checkTimer);
       signal?.removeEventListener('abort', cancel);
       if (frame !== null) cancelAnimationFrame(frame);
     };
@@ -397,12 +403,17 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
       reject(createAbortError());
     };
 
-    const observer = new MutationObserver(() => {
+    // Reading scrollHeight forces layout of the whole list, so check once per burst of mutations.
+    const check = () => {
+      checkTimer = 0;
       const historyAdvanced = container.scrollHeight !== initialHeight ||
         getOldestTimestamp() !== initialOldest;
-      if (!historyAdvanced) return;
+      if (!historyAdvanced) { if (framesDone && !settleTimer) finish(); return; }
       clearTimeout(settleTimer);
       settleTimer = setTimeout(finish, 120);
+    };
+    const observer = new MutationObserver(() => {
+      if (!checkTimer) checkTimer = setTimeout(check, 40);
     });
     observer.observe(container, { childList: true, subtree: true });
     timeoutTimer = setTimeout(finish, timeoutMs);
@@ -412,7 +423,8 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
       frame = requestAnimationFrame(() => {
         frame = requestAnimationFrame(() => {
           frame = null;
-          if (!settleTimer) finish();
+          framesDone = true;
+          if (!settleTimer && !checkTimer) finish();
         });
       });
     }
@@ -450,7 +462,9 @@ function getConversationName() {
 
 function createExtractionCache(container) {
   let entries = new WeakMap();
+  let changed = true;
   const invalidate = records => {
+    if (records.length) changed = true;
     for (const record of records) {
       const element = record.target.nodeType === 1 ? record.target : record.target.parentElement;
       const group = element?.closest(SEL.messageGroups);
@@ -462,6 +476,12 @@ function createExtractionCache(container) {
   const observer = new MutationObserver(invalidate);
   observer.observe(container, { subtree: true, childList: true, characterData: true, attributes: true });
   return {
+    changed() {
+      invalidate(observer.takeRecords());
+      const result = changed;
+      changed = false;
+      return result;
+    },
     read(group, date, parse) {
       invalidate(observer.takeRecords());
       const groupId = group.getAttribute?.(SEL?.attrs?.groupId) || '';
