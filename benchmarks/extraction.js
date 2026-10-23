@@ -19,6 +19,7 @@ function createHarness(source) {
     nodeType: 1,
     id,
     closest() { return this; },
+    matches() { return false; },
     getBoundingClientRect() { return { top: id * 20, bottom: id * 20 + 18 }; },
     getAttribute(name) { return name === 'data-id' ? `group-${id}` : ''; }
   }));
@@ -31,7 +32,7 @@ function createHarness(source) {
   };
   const document = {
     querySelector() { return null; },
-    querySelectorAll(selector) { return selector === '.group' ? groups : []; }
+    querySelectorAll(selector) { return selector.includes('.group') ? groups : []; }
   };
   class MutationObserver {
     observe() {}

@@ -422,6 +422,10 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
 }
 
 function getOldestTimestamp() {
+  // History renders oldest-first, so the first stamped node is the oldest; avoids a full-DOM scan per call.
+  const first = document.querySelector(SEL.absoluteTimestampAttr);
+  const firstValue = first ? parseInt(first.getAttribute(SEL.attrs.absoluteTimestamp), 10) || 0 : 0;
+  if (firstValue) return firstValue;
   let oldest = 0;
   document.querySelectorAll(SEL.absoluteTimestampAttr).forEach(ts => {
     const value = parseInt(ts.getAttribute(SEL.attrs.absoluteTimestamp), 10) || 0;
@@ -475,18 +479,23 @@ function extractMessages(cache = null) {
   const results = [];
   const seen = new Set();
 
-  // Build date separator positions for date association
-  const dateSeps = [];
-  document.querySelectorAll(SEL.dateSeparator).forEach(el => {
-    const text = cleanText(el.textContent);
-    if (text) dateSeps.push({ text, top: el.getBoundingClientRect().top });
-  });
-
-  const groups = document.querySelectorAll(SEL.messageGroups);
-  for (const group of groups) {
-    const top = group.getBoundingClientRect().top;
-    const date = [...dateSeps].reverse().find(sep => sep.top <= top)?.text || dateSeps[0]?.text || '';
-    const msgs = cache ? cache.read(group, date, () => extractFromGroup(group, dateSeps)) : extractFromGroup(group, dateSeps);
+  // Document order gives each group's date without getBoundingClientRect, which forces layout of the whole list.
+  const nodes = [...document.querySelectorAll(`${SEL.dateSeparator}, ${SEL.messageGroups}`)];
+  const isSeparator = el => el.matches(SEL.dateSeparator);
+  let date = '';
+  // Groups above the first separator take that separator's date.
+  for (const el of nodes) {
+    if (!isSeparator(el)) continue;
+    date = cleanText(el.textContent);
+    if (date) break;
+  }
+  for (const group of nodes) {
+    if (isSeparator(group)) {
+      const text = cleanText(group.textContent);
+      if (text) date = text;
+      continue;
+    }
+    const msgs = cache ? cache.read(group, date, () => extractFromGroup(group, date)) : extractFromGroup(group, date);
     for (let i = 0; i < msgs.length; i++) {
       const msg = msgs[i];
       const hasMedia = msg.media && msg.media.length > 0;
@@ -519,7 +528,7 @@ function extractMessages(cache = null) {
   return results;
 }
 
-function extractFromGroup(group, dateSeps) {
+function extractFromGroup(group, date) {
   const results = [];
 
   // Sender
@@ -551,16 +560,6 @@ function extractFromGroup(group, dateSeps) {
     timestamp = cleanText(tsEl.textContent);
     const tsAttr = tsEl.getAttribute(SEL.attrs.absoluteTimestamp);
     if (tsAttr) absoluteTimestamp = parseInt(tsAttr, 10) || 0;
-  }
-
-  // Date association
-  let date = '';
-  if (dateSeps.length > 0) {
-    const groupTop = group.getBoundingClientRect().top;
-    for (let i = dateSeps.length - 1; i >= 0; i--) {
-      if (dateSeps[i].top <= groupTop) { date = dateSeps[i].text; break; }
-    }
-    if (!date) date = dateSeps[0].text;
   }
 
   // Message text elements
