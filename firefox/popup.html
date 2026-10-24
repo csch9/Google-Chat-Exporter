@@ -287,6 +287,23 @@
     }
     .tip-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
 
+    /* ── Advanced scan options ── */
+    .advanced > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 14px;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .advanced > summary::-webkit-details-marker { display: none; }
+    .advanced > summary::after { content: '▸'; margin-left: auto; color: var(--text-3); transition: transform .15s; }
+    .advanced[open] > summary::after { transform: rotate(90deg); }
+    .advanced[open] > summary { border-bottom: 1px solid var(--border); }
+
     /* ── Footer ── */
     .footer {
       padding: 10px 20px 14px;
@@ -421,6 +438,94 @@
         </label>
       </div>
     </div>
+
+    <details class="option-group advanced" id="advanced">
+      <summary><span class="option-icon">⚙️</span>Advanced Scan Options</summary>
+
+      <div class="option-row">
+        <div class="option-label">
+          Free Memory While Scanning
+          <div class="option-sub">Temporarily removes collected messages from the page to keep long scans fast. Restored when done.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-prune-dom" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Segmented Scanning
+          <div class="option-sub">Every 4000 messages, reopens Chat at the oldest message to stay fast. Needs message links to work in your workspace.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-segmented-scan" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Nudge History Loading
+          <div class="option-sub">Sends a scroll-up event as soon as the top is reached, so Chat loads older messages sooner.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-history-nudge" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Stop Keeps Collected Messages
+          <div class="option-sub">First × during the scan exports what was collected; a second × cancels.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-stop-keeps-messages" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Reuse Scan After a Failure
+          <div class="option-sub">A failed export keeps its messages and media; exporting again skips the rescan.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-retry-reuse" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Save Scan Backup
+          <div class="option-sub">Downloads a JSON copy of scans with 1000+ messages before packaging.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-scan-backup" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Diagnostic Logging
+          <div class="option-sub">Logs scan timing, load latency and memory to the page console.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-diagnostics">
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+    </details>
 
     <!-- Export button -->
     <button class="export-btn" id="export-btn">

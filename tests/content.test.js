@@ -679,10 +679,10 @@ test('oldest-message link follows the app URL, falling back to the copied-link f
   c.document.querySelector = () => group;
   c.location = { href: 'https://chat.google.com/app/chat/AAAAtnkdPQo' };
   assert.deepEqual({ ...c.oldestMessageLink() }, {
-    link: 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo' });
+    link: 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
   c.location = { href: 'https://mail.google.com/chat/u/0/#chat/space/AAAAtnkdPQo' };
   assert.deepEqual({ ...c.oldestMessageLink() }, {
-    link: 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo' });
+    link: 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
 });
 
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
@@ -703,6 +703,49 @@ test('console export packages on-page messages with media as a complete export, 
   assert.equal(packaged.mediaFiles.length, 1);
   assert.equal(packaged.history.reason, 'idle');
   assert.equal(packaged.history.warning, '');
+});
+
+test('advanced scan options turn off segmentation, retry reuse, backups and stop-keeps-messages', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.chrome.storage.local.get = async () => ({ gceSettings: { segmentedScan: false, retryReuse: false, scanBackup: false, stopKeepsMessages: false } });
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let backups = 0;
+  c.saveScanBackup = () => { backups++; };
+  const limits = [];
+  let stopDuringScan;
+  c.scrollToLoadAll = async (_progress, _cutoff, _signal, segmentLimit) => {
+    limits.push(segmentLimit);
+    stopDuringScan = vm.runInContext('historyScanStop', c);
+    return { messages: Array.from({ length: 1200 }, (_, i) => ({ text: String(i) })), reason: 'idle', warning: '' };
+  };
+  let fail = true;
+  c.chrome.runtime.sendMessage = packageRecorder(() => fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' });
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.deepEqual(limits, [0, 0], 'no segmentation, and the retry rescans');
+  assert.equal(stopDuringScan, null, 'the first click cancels instead of keeping messages');
+  assert.equal(backups, 0);
+});
+
+test('turning off DOM pruning scans without detaching anything', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  vm.runInContext('scanOptions = { ...scanOptions, pruneDom: false }', c);
+  c.createHistoryPruner = () => { throw new Error('pruner must not be created'); };
+  const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
+    getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+  c.findScrollContainer = () => container;
+  c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
+  c.getOldestTimestamp = () => 1;
+  const controller = new AbortController();
+  const pending = c.scrollToLoadAll(null, 0, controller.signal);
+  controller.abort();
+  assert.equal((await pending).reason, 'stopped');
 });
 
 test('conversation identity comes from the chat address', () => {

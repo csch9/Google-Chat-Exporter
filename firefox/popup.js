@@ -6,6 +6,17 @@
 
 const $ = id => document.getElementById(id);
 
+// Advanced scan options: settings key -> checkbox id. Defaults live in the checkboxes' `checked` state.
+const SCAN_OPTION_INPUTS = {
+  pruneDom: 'opt-prune-dom',
+  segmentedScan: 'opt-segmented-scan',
+  historyNudge: 'opt-history-nudge',
+  stopKeepsMessages: 'opt-stop-keeps-messages',
+  retryReuse: 'opt-retry-reuse',
+  scanBackup: 'opt-scan-backup',
+  diagnostics: 'opt-diagnostics'
+};
+
 // ── Settings persistence ─────────────────────────────────────
 
 async function loadSettings() {
@@ -17,6 +28,9 @@ async function loadSettings() {
     if (typeof s.includeMedia !== 'undefined') $('include-media').checked = s.includeMedia;
     if (s.dateFrom) $('date-from').value = s.dateFrom;
     $('incremental').checked = s.incremental === true;
+    for (const [key, id] of Object.entries(SCAN_OPTION_INPUTS)) {
+      if (typeof s[key] === 'boolean') $(id).checked = s[key];
+    }
     updateIncrementalControls();
     updateMediaRowVisibility();
   } catch { /* storage not accessible */ }
@@ -30,6 +44,7 @@ function saveSettings() {
     dateFrom: $('date-from').value,
     incremental: $('incremental').checked
   };
+  for (const [key, id] of Object.entries(SCAN_OPTION_INPUTS)) settings[key] = $(id).checked;
   chrome.storage.local.set({ gceSettings: settings }).catch(() => {});
 }
 
@@ -240,5 +255,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('include-media').addEventListener('change', saveSettings);
   $('date-from').addEventListener('change', saveSettings);
   $('incremental').addEventListener('change', () => { updateIncrementalControls(); saveSettings(); });
+  for (const id of Object.values(SCAN_OPTION_INPUTS)) $(id).addEventListener('change', saveSettings);
   $('export-mode').addEventListener('change', toggleExportMode);
 });
