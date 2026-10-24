@@ -1692,7 +1692,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     // Send to background for packaging & download
     const historyInfo = { reason: history.reason, warning: history.warning, since: history.since };
     const checkpoint = candidate ? { key: checkpointKey, value: candidate } : null;
-    const stats = buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt });
+    const stats = buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt: segmentJob?.startedAt || runStartedAt });
     let resp;
     if (format === 'html') {
       // One request per ZIP part: a single long request gets the service worker killed (~5 min limit) and holds all media at once.

@@ -763,7 +763,7 @@ test('a reopened segment that stalls is reopened elsewhere, then exported with a
   let packaged = null;
   const pack = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
   c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? (navigations.push(msg.url), { success: true }) : pack(msg);
-  const job = { id: 'j', segments: 1, collected: 3000, options: { format: 'txt' }, retries: 0 };
+  const job = { id: 'j', segments: 1, collected: 3000, options: { format: 'txt' }, retries: 0, startedAt: Date.now() - 60000 };
   store[`gceSegment:j:0`] = [{ _dedupKey: 'y', text: 'y', absoluteTimestamp: Date.UTC(2024, 5, 1) }];
 
   assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'segment');
@@ -783,6 +783,7 @@ test('a reopened segment that stalls is reopened elsewhere, then exported with a
   assert.equal(navigations.length, 1);
   assert.equal(packaged.history.reason, 'idle');
   assert.equal(packaged.history.warning, '');
+  assert.ok(packaged.stats.exportSeconds >= packaged.stats.scan.seconds, 'total time covers every segment');
 });
 
 test('a reopened page that barely loads anything gives up after fewer idle checks', async () => {
