@@ -136,7 +136,7 @@ function showProgress(text, percent, state = 'working') {
       }
       .gce-header {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 10px;
         padding: 14px 16px 10px;
       }
@@ -157,11 +157,18 @@ function showProgress(text, percent, state = 'working') {
         font-size: 13px;
         color: #3c4043;
         flex: 1;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        overflow-wrap: anywhere;
+        line-height: 1.4;
+        max-height: 7em;
+        overflow-y: auto;
         font-weight: 500;
       }
+      .gce-hint {
+        font-size: 11px;
+        color: #80868b;
+        padding: 0 16px 10px 48px;
+      }
+      .gce-hint:empty { display: none; }
       .gce-close {
         background: none;
         border: none;
@@ -214,15 +221,16 @@ function showProgress(text, percent, state = 'working') {
           <span class="gce-label">Initializing...</span>
           <button class="gce-close" title="Dismiss">&times;</button>
         </div>
+        <div class="gce-hint"></div>
         <div class="gce-bar-wrap"><div class="gce-bar"></div></div>
       </div>`;
 
     document.documentElement.appendChild(progressEl);
     progressEl.querySelector('.gce-close').addEventListener('click', () => {
       if (exportInProgress && historyScanStop) {
-        showProgress('Stopping scan — exporting collected messages (click again to cancel)...', 15);
         historyScanStop.abort();
         historyScanStop = null;
+        showProgress('Stopping scan — exporting the messages collected so far...', 15);
       } else if (exportInProgress && exportController) {
         showProgress('Cancelling export...', 0);
         exportController.abort();
@@ -237,6 +245,13 @@ function showProgress(text, percent, state = 'working') {
   const spinner = progressEl.querySelector('.gce-spinner');
 
   if (label) label.textContent = text;
+  // Tells the user what × does right now: stop-and-export while scanning, abort afterwards.
+  const hint = exportInProgress && historyScanStop ? '× stops loading and exports the messages collected so far'
+    : exportInProgress && exportController ? '× aborts the export without saving' : '';
+  const hintEl = progressEl.querySelector('.gce-hint');
+  if (hintEl) hintEl.textContent = hint;
+  const close = progressEl.querySelector('.gce-close');
+  if (close) close.title = hint || 'Dismiss';
   if (bar) {
     bar.style.width = percent + '%';
     bar.className = 'gce-bar' + (state === 'done' ? ' done' : state === 'error' ? ' error' : '');
