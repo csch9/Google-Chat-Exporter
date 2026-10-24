@@ -20,6 +20,9 @@ Works across **Google Chrome, Mozilla Firefox, Brave, Microsoft Edge**, standalo
   - **Structured HTML (`.html + .zip`)**: Complete conversational archive with sender avatars, speech bubbles, embedded images, GIFs, audio notes, video chips, documents, and Google Meet call links.
 - **Full Media Extraction**: Automatically downloads photos, GIFs, file attachments, and video previews into a neat `media/` folder inside the ZIP.
 - **Adaptive History Loading**: Loads history batch-by-batch and continues as soon as Google Chat adds the next batch.
+- **Very Long Histories**: Tens of thousands of messages stay fast by removing already-collected messages from the page while scanning and by continuing long scans in a fresh page every 4000 messages. Both can be turned off under **Advanced Scan Options**.
+- **Large Media Archives**: HTML exports with many attachments are split into several ZIP parts (`…_part1of3.zip`, …); extract them all into one folder.
+- **Safe Retries**: A failed export keeps its scanned messages and downloaded media, so exporting again skips the rescan. Long scans also save a JSON backup that can be exported later.
 - **Optional Date Cutoff**: Stop loading once the export reaches a selected “messages since” date.
 - **New Since Last Export**: Optional per-conversation checkpoints for TXT, HTML, and HTML with attachments. Each run saves a separate file; the first run establishes a baseline. Checkpoints advance after a completed download. Turn the option off for a full re-export.
 - **Auto-Export on Open**: Turn it on in the popup, then open each channel you want; every channel is exported once with your current settings as soon as it loads. Switching away mid-export cancels that export so it retries on your next visit. The mode turns off after 10 minutes without a channel switch and whenever the browser restarts; an `AUTO` badge shows while it is on.
@@ -97,6 +100,24 @@ Install directly from your browser's official store:
 
 Each incremental run creates a new file. Keep earlier files to retain the complete archive. Checkpoints are local to the browser profile and advance only after Chrome reports a completed download.
 
+### Advanced scan options
+
+All options are on by default except diagnostic logging.
+
+| Option | What it does | Turn it off if… |
+|---|---|---|
+| **Free Memory While Scanning** | Temporarily removes already-collected messages from the page during the scan and puts them back afterwards, keeping long scans fast. | You want the page left untouched while scanning. |
+| **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
+| **Nudge History Loading** | Sends a scroll-up event as soon as the top is reached so Chat loads older messages sooner. | History loading misbehaves in your workspace. |
+| **Stop Keeps Collected Messages** | The first × during the scan exports what was collected; a second × cancels. | You want × to always cancel. |
+| **Reuse Scan After a Failure** | A failed export keeps its messages and downloaded media; exporting again skips the rescan (the file notes when the scan was made). | You always want a fresh scan. |
+| **Save Scan Backup** | Downloads a JSON copy of scans with 1000+ messages before media download and packaging. | You don't want the extra file. |
+| **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | — |
+
+### Exporting a backup or a kept scan from the console
+
+Open DevTools on the Chat tab, switch the Console context to **Google Chat Exporter**, and run `gceExportFromMemory()`. It exports, in order of preference, a kept scan from a failed export, stored segments of an interrupted segmented scan, or the messages currently on the page, as HTML with media and without scrolling. Pass a parsed backup to export it instead: `gceExportFromMemory(JSON.parse(text))`.
+
 ## ⚡ Performance benchmark
 
 Run `npm run benchmark` to compare repeated message extraction with upstream v2 commit `005a22f`. The synthetic workload uses 250 rendered message groups, 160 overlapping collections, alternates execution order, and reports the median of seven rounds.
@@ -119,6 +140,7 @@ Results are representative rather than universal and vary by machine. This bench
   - `contextMenus`: For convenient right-click options.
   - `downloads`: To save the exported file to your computer.
   - `storage`: To remember your format preferences locally.
+  - `unlimitedStorage`: To keep the messages of a segmented scan locally while Chat is reopened; they are deleted after the export.
 
 ---
 
