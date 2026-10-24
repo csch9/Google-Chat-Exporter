@@ -30,6 +30,8 @@ async function loadSettings() {
     for (const [key, id] of Object.entries(SCAN_OPTION_INPUTS)) {
       if (typeof s[key] === 'boolean') $(id).checked = s[key];
     }
+    if ([...$('opt-segment-size').options].some(o => Number(o.value) === s.segmentSize)) $('opt-segment-size').value = String(s.segmentSize);
+    updateSegmentSizeRow();
     updateIncrementalControls();
     updateMediaRowVisibility();
   } catch { /* storage not accessible */ }
@@ -44,7 +46,14 @@ function saveSettings() {
     incremental: $('incremental').checked
   };
   for (const [key, id] of Object.entries(SCAN_OPTION_INPUTS)) settings[key] = $(id).checked;
+  settings.segmentSize = Number($('opt-segment-size').value);
   chrome.storage.local.set({ gceSettings: settings }).catch(() => {});
+}
+
+function updateSegmentSizeRow() {
+  const enabled = $('opt-segmented-scan').checked;
+  $('segment-size-row').style.opacity = enabled ? '1' : '0.45';
+  $('opt-segment-size').disabled = !enabled;
 }
 
 function updateMediaRowVisibility() {
@@ -255,5 +264,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('date-from').addEventListener('change', saveSettings);
   $('incremental').addEventListener('change', () => { updateIncrementalControls(); saveSettings(); });
   for (const id of Object.values(SCAN_OPTION_INPUTS)) $(id).addEventListener('change', saveSettings);
+  $('opt-segmented-scan').addEventListener('change', updateSegmentSizeRow);
+  $('opt-segment-size').addEventListener('change', saveSettings);
   $('export-mode').addEventListener('change', toggleExportMode);
 });

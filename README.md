@@ -20,7 +20,7 @@ Works across **Google Chrome, Mozilla Firefox, Brave, Microsoft Edge**, standalo
   - **Structured HTML (`.html + .zip`)**: Complete conversational archive with sender avatars, speech bubbles, embedded images, GIFs, audio notes, video chips, documents, and Google Meet call links.
 - **Full Media Extraction**: Automatically downloads photos, GIFs, file attachments, and video previews into a neat `media/` folder inside the ZIP.
 - **Adaptive History Loading**: Loads history batch-by-batch and continues as soon as Google Chat adds the next batch.
-- **Very Long Histories**: Tens of thousands of messages stay fast by removing already-collected messages from the page while scanning and by continuing long scans in a fresh page every 4000 messages. Both can be turned off under **Advanced Scan Options**.
+- **Very Long Histories**: Tens of thousands of messages stay fast by removing already-collected messages from the page while scanning and by continuing long scans in a fresh page every few thousand messages (2,000–5,000, default 4,000). Both can be turned off under **Advanced Scan Options**.
 - **Large Media Archives**: HTML exports with many attachments are split into several ZIP parts (`…_part1of3.zip`, …); extract them all into one folder.
 - **Safe Retries**: A failed export keeps its scanned messages and downloaded media, so exporting again skips the rescan. Long scans also save a JSON backup that can be exported later.
 - **Optional Date Cutoff**: Stop loading once the export reaches a selected “messages since” date.
@@ -111,11 +111,12 @@ All options are on by default except diagnostic logging. Options marked ⚠️ c
 | Option | What it does | Turn it off if… |
 |---|---|---|
 | ⚠️ **Free Memory While Scanning** | Temporarily removes already-collected messages from the page during the scan and puts them back afterwards, keeping long scans fast. Chat can redraw parts of the list in the meantime, so the conversation may look garbled or incomplete until you reload the tab. | You want the page left untouched while scanning. |
-| ⚠️ **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. The tab navigates on its own and ends at an old message; reload the chat afterwards. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
+| ⚠️ **Segmented Scanning** | Every *Segment Size* messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. The tab navigates on its own and ends at an old message; reload the chat afterwards. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
+| **Segment Size** | Messages per segment: 2,000, 3,000, 4,000 (default) or 5,000. Smaller segments suit computers with less memory; each extra reopen adds a few seconds. | — |
 | **Nudge History Loading** | Sends a scroll-up event as soon as the top is reached so Chat loads older messages sooner. | History loading misbehaves in your workspace. |
 | **Reuse Scan After a Failure** | A failed export keeps its messages and downloaded media; exporting again skips the rescan (the file notes when the scan was made). | You always want a fresh scan. |
 | **Save Scan Backup** | Downloads one zipped JSON copy (`…_scan-backup_….zip`) of scans with 1000+ messages when the export ends, whether it finished, failed or was cancelled. Segmented scans keep their segments in local storage in the meantime, so a long scan is never interrupted by downloads. | You don't want the extra file. |
-| **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | — |
+| **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | You're not a developer |
 
 ### Disaster recovery from the console
 

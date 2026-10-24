@@ -788,6 +788,26 @@ test('advanced scan options turn off segmentation, retry reuse and backups; stop
   assert.equal(backups, 0);
 });
 
+test('segment size comes from the settings and falls back to 4000 for unsupported values', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  let stored = { segmentSize: 2000 };
+  c.chrome.storage.local.get = async () => ({ gceSettings: stored });
+  assert.equal((await c.readScanOptions()).segmentSize, 2000);
+  stored = { segmentSize: 1000 };
+  assert.equal((await c.readScanOptions()).segmentSize, 4000);
+  stored = { segmentSize: '3000' };
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let limit;
+  c.scrollToLoadAll = async (_p, _c, _s, segmentLimit) => { limit = segmentLimit; return { messages: [{ text: 'a' }], reason: 'idle', warning: '' }; };
+  c.chrome.runtime.sendMessage = packageRecorder(() => ({ success: true, filename: 'x.txt' }));
+  await c.runExport({ format: 'txt' });
+  assert.equal(limit, 3000);
+});
+
 test('turning off DOM pruning scans without detaching anything', async () => {
   const c = loadContent();
   await c.loadSelectors();

@@ -459,7 +459,7 @@
       <div class="option-row">
         <div class="option-label">
           Segmented Scanning
-          <div class="option-sub">Every 4000 messages, reopens Chat at the oldest message to stay fast. Needs message links to work in your workspace.</div>
+          <div class="option-sub">Every few thousand messages, reopens Chat at the oldest message to stay fast. Needs message links to work in your workspace.</div>
           <div class="option-warn">⚠️ The tab navigates on its own and ends at an old message; reload the chat when the export finishes.</div>
         </div>
         <label class="toggle">
@@ -467,6 +467,19 @@
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
+      </div>
+
+      <div class="option-row" id="segment-size-row">
+        <div class="option-label">
+          Segment Size
+          <div class="option-sub">Messages per segment. Use a smaller size on computers with less memory.</div>
+        </div>
+        <select class="format-select" id="opt-segment-size" aria-label="Messages per segment">
+          <option value="2000">2,000</option>
+          <option value="3000">3,000</option>
+          <option value="4000" selected>4,000</option>
+          <option value="5000">5,000</option>
+        </select>
       </div>
 
       <div class="option-row">

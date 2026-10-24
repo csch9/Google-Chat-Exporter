@@ -88,20 +88,24 @@ let retainedScan = null;
 // Optional scan behaviours, toggled in the popup (stored with the other settings in gceSettings).
 const SCAN_OPTION_DEFAULTS = {
   pruneDom: true,          // detach collected history from the page while scanning
-  segmentedScan: true,     // reopen Chat at the oldest collected message every SEGMENT_MESSAGES
+  segmentedScan: true,     // reopen Chat at the oldest collected message every segmentSize messages
+  segmentSize: 4000,       // one of SEGMENT_SIZES; smaller suits machines with less memory
   historyNudge: true,      // send a wheel event as soon as the scan reaches the top
   retryReuse: true,        // a failed export keeps its scan and media for the next attempt
   scanBackup: true,        // download a JSON backup after long scans
   diagnostics: false       // log scan timing, load latency and memory
 };
 let scanOptions = { ...SCAN_OPTION_DEFAULTS };
+const SEGMENT_SIZES = [2000, 3000, 4000, 5000];
 
 async function readScanOptions() {
   try {
     const { gceSettings } = await chrome.storage.local.get('gceSettings');
     const stored = gceSettings || {};
-    return Object.fromEntries(Object.entries(SCAN_OPTION_DEFAULTS)
-      .map(([key, value]) => [key, typeof stored[key] === 'boolean' ? stored[key] : value]));
+    return Object.fromEntries(Object.entries(SCAN_OPTION_DEFAULTS).map(([key, value]) => {
+      if (key === 'segmentSize') return [key, SEGMENT_SIZES.includes(Number(stored[key])) ? Number(stored[key]) : value];
+      return [key, typeof stored[key] === 'boolean' ? stored[key] : value];
+    }));
   } catch {
     return { ...SCAN_OPTION_DEFAULTS };
   }
@@ -1342,7 +1346,6 @@ async function saveScanBackup(messages, conversationName) {
 // ── Segmented history scans ─────────────────────────────────
 // Chat slows down with every message loaded in a tab, so long scans hop to a fresh page opened at the
 // oldest collected message. Segments live in extension storage so they survive the navigation.
-const SEGMENT_MESSAGES = 4000;
 const SEGMENT_JOB_KEY = 'gceSegmentJob';
 const SEGMENT_HOP_MAX_AGE_MS = 10 * 60 * 1000;
 const segmentKey = (jobId, n) => `gceSegment:${jobId}:${n}`;
@@ -1517,7 +1520,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
           (text) => showProgress(segmentLabel + text, 15),
           dateFromTs,
           scanStop.signal,
-          incremental || auto || !scanOptions.segmentedScan ? 0 : SEGMENT_MESSAGES
+          incremental || auto || !scanOptions.segmentedScan ? 0 : scanOptions.segmentSize
         );
       } finally {
         historyScanStop = null;
