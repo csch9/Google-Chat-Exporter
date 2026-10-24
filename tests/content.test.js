@@ -808,6 +808,26 @@ test('segment size comes from the settings and falls back to 4000 for unsupporte
   assert.equal(limit, 3000);
 });
 
+test('segmented progress shows messages in this segment and the running total', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.sleep = async () => {};
+  c.chrome.storage.local.set = async () => {};
+  c.loadSegments = async () => [[]];
+  const shown = [];
+  c.showProgress = text => shown.push(text);
+  c.scrollToLoadAll = async onProgress => {
+    onProgress('Loading history... 1500 messages collected', 1500);
+    onProgress('Reached date range boundary — stopping scroll.');
+    return { messages: [], reason: 'idle', warning: '' };
+  };
+  await c.runExport({ format: 'txt', segmentJob: { id: 'j', segments: 2, collected: 8000 } });
+  assert.ok(shown.includes('Segment 3: loading history... 1,500 messages in this segment, ~9,500 total'));
+  assert.ok(shown.includes('Segment 3: Reached date range boundary — stopping scroll.'));
+});
+
 test('turning off DOM pruning scans without detaching anything', async () => {
   const c = loadContent();
   await c.loadSelectors();

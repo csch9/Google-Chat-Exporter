@@ -518,7 +518,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
         }
 
         if (batches % 2 === 0) {
-          onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`);
+          onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`, dedupMap.size);
         }
       }
     } catch (err) {
@@ -1514,14 +1514,15 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       const forwardCancel = () => scanStop.abort();
       signal.addEventListener('abort', forwardCancel, { once: true });
       historyScanStop = scanStop;
-      const segmentLabel = segmentJob ? `Segment ${segmentJob.segments + 1}: ` : '';
+      const segmentLimit = incremental || auto || !scanOptions.segmentedScan ? 0 : scanOptions.segmentSize;
+      const segmentNumber = (segmentJob?.segments || 0) + 1;
+      const before = segmentJob?.collected || 0;
+      // Earlier segments overlap this one by a few messages, so the total is approximate after the first hop.
+      const progress = (text, count) => showProgress(!segmentLimit && !segmentJob ? text
+        : count == null ? `Segment ${segmentNumber}: ${text}`
+        : `Segment ${segmentNumber}: loading history... ${count.toLocaleString()} messages in this segment, ${before ? '~' : ''}${(before + count).toLocaleString()} total`, 15);
       try {
-        history = await scrollToLoadAll(
-          (text) => showProgress(segmentLabel + text, 15),
-          dateFromTs,
-          scanStop.signal,
-          incremental || auto || !scanOptions.segmentedScan ? 0 : scanOptions.segmentSize
-        );
+        history = await scrollToLoadAll(progress, dateFromTs, scanStop.signal, segmentLimit);
       } finally {
         historyScanStop = null;
         signal.removeEventListener('abort', forwardCancel);
