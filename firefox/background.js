@@ -397,7 +397,7 @@ async function ensureContentScript(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
-      files: ['content.js']
+      files: ['lib/jszip.min.js', 'content.js']
     });
     // Wait for initialization
     await sleep(400);

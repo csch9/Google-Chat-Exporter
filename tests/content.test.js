@@ -710,6 +710,37 @@ test('console backup saves the kept scan and a picked backup file is exported', 
   assert.equal(exported[0].options.format, 'txt');
 });
 
+test('scan backups are zipped when JSZip is loaded, and zipped backups can be exported', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  const zipped = [];
+  c.JSZip = class {
+    file(name, data) { zipped.push({ name, data }); return this; }
+    async generateAsync() { return 'ZIP'; }
+    static async loadAsync() {
+      return { files: { 'dir/': { dir: true, name: 'dir/' }, 'b.json': { dir: false, name: 'b.json', async: async () => '[{"text":"z"}]' } } };
+    }
+  };
+  c.URL = { createObjectURL: blob => `blob:${blob}`, revokeObjectURL() {} };
+  const anchors = [];
+  c.document.documentElement = { appendChild() {} };
+  c.document.createElement = () => { const a = { click() {}, remove() {} }; anchors.push(a); return a; };
+  await c.saveScanBackup([{ text: 'a' }], 'My Chat');
+  assert.match(anchors[0].download, /^My_Chat_scan-backup_.*\.zip$/);
+  assert.equal(anchors[0].href, 'blob:ZIP');
+  assert.match(zipped[0].name, /\.json$/);
+  assert.equal(zipped[0].data, '[{"text":"a"}]');
+
+  let input;
+  c.document.createElement = () => (input = { click() {}, files: [{ name: 'backup.zip' }] });
+  let exported;
+  c.gceExportFromMemory = async messages => { exported = messages; return 'done'; };
+  const pending = c.gceExportBackupFile();
+  await input.onchange();
+  assert.equal(await pending, 'done');
+  assert.deepEqual(Array.from(exported, m => m.text), ['z']);
+});
+
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
   const c = loadContent();
   await c.loadSelectors();

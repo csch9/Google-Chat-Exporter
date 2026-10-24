@@ -114,7 +114,7 @@ All options are on by default except diagnostic logging. Options marked ⚠️ c
 | ⚠️ **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. The tab navigates on its own and ends at an old message; reload the chat afterwards. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
 | **Nudge History Loading** | Sends a scroll-up event as soon as the top is reached so Chat loads older messages sooner. | History loading misbehaves in your workspace. |
 | **Reuse Scan After a Failure** | A failed export keeps its messages and downloaded media; exporting again skips the rescan (the file notes when the scan was made). | You always want a fresh scan. |
-| **Save Scan Backup** | Downloads one JSON copy of scans with 1000+ messages when the export ends, whether it finished, failed or was cancelled. Segmented scans keep their segments in local storage in the meantime, so a long scan is never interrupted by downloads. | You don't want the extra file. |
+| **Save Scan Backup** | Downloads one zipped JSON copy (`…_scan-backup_….zip`) of scans with 1000+ messages when the export ends, whether it finished, failed or was cancelled. Segmented scans keep their segments in local storage in the meantime, so a long scan is never interrupted by downloads. | You don't want the extra file. |
 | **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | — |
 
 ### Disaster recovery from the console
@@ -123,9 +123,9 @@ Open DevTools on the Chat tab and switch the Console context (the `top` dropdown
 
 | Command | What it does |
 |---|---|
-| `gceSaveBackup()` | Downloads a backup JSON of the messages available right now: a kept scan from a failed export, else the stored segments of an interrupted segmented scan, else the messages currently on the page. Works even with **Save Scan Backup** turned off. |
+| `gceSaveBackup()` | Downloads a zipped backup JSON of the messages available right now: a kept scan from a failed export, else the stored segments of an interrupted segmented scan, else the messages currently on the page. Works even with **Save Scan Backup** turned off. |
 | `gceExportFromMemory()` | Exports those same messages as HTML with media, without scrolling. |
-| `gceExportBackupFile()` | Opens a file picker; choose a backup JSON (`…_scan-backup_….json`) to export it as HTML with media, without scrolling. Pass `{ format: 'txt' }` for a text export. |
+| `gceExportBackupFile()` | Opens a file picker; choose a backup (`…_scan-backup_….zip`, or the `.json` inside it) to export it as HTML with media, without scrolling. Pass `{ format: 'txt' }` for a text export. |
 
 If a packaging step fails after the media download, run `gceExportFromMemory()` again: it reuses the downloaded media and continues with the ZIP part that failed.
 

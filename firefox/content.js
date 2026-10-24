@@ -1317,11 +1317,18 @@ const retryHint = () => retainedScan ? ` — ${retainedScan.history.messages.len
 let SCAN_BACKUP_MIN_MESSAGES = 1000;
 // Media per ZIP part; each part's base64 must stay well under the ~512 Mi-char JS string limit in the background.
 let ZIP_PART_BASE64_BUDGET = 150_000_000;
-function saveScanBackup(messages, conversationName) {
+async function saveScanBackup(messages, conversationName) {
   try {
+    const base = `${(conversationName || 'chat').replace(/[^a-zA-Z0-9._-]+/g, '_')}_scan-backup_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}`;
+    const json = JSON.stringify(messages);
+    // JSZip is loaded next to this script by the manifest; a script injected on its own falls back to plain JSON.
+    const zipped = typeof JSZip === 'function';
+    const blob = zipped
+      ? await new JSZip().file(`${base}.json`, json).generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+      : new Blob([json], { type: 'application/json' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(messages)], { type: 'application/json' }));
-    a.download = `${(conversationName || 'chat').replace(/[^a-zA-Z0-9._-]+/g, '_')}_scan-backup_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+    a.href = URL.createObjectURL(blob);
+    a.download = `${base}.${zipped ? 'zip' : 'json'}`;
     document.documentElement.appendChild(a);
     a.click();
     a.remove();
@@ -1699,7 +1706,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
 async function saveRunBackup(scanned, segmentJob) {
   try {
     const messages = segmentJob?.segments ? mergeMessages(...await loadSegments(segmentJob), scanned || []) : scanned;
-    if (messages?.length >= SCAN_BACKUP_MIN_MESSAGES) saveScanBackup(messages, getConversationName());
+    if (messages?.length >= SCAN_BACKUP_MIN_MESSAGES) await saveScanBackup(messages, getConversationName());
   } catch (err) {
     console.error('[Google Chat Exporter] could not save scan backup:', err);
   }
@@ -1708,7 +1715,7 @@ async function saveRunBackup(scanned, segmentJob) {
 // Console entry points (select the extension's content-script context in DevTools):
 //   gceExportFromMemory()          -> retained scan, else stored scan segments, else every message on the page
 //   gceExportFromMemory(messages)  -> an explicit array, e.g. parsed from a backup JSON
-//   gceExportBackupFile()          -> pick a backup JSON file and export it
+//   gceExportBackupFile()          -> pick a backup .zip or .json file and export it
 //   gceSaveBackup()                -> download the messages gceExportFromMemory() would use as a backup JSON
 // Exports run the normal HTML + media export as a complete one, without scrolling.
 async function resolveMemoryMessages(messages = null) {
@@ -1731,7 +1738,7 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
 
 async function gceSaveBackup(messages = null) {
   const resolved = await resolveMemoryMessages(messages);
-  saveScanBackup(resolved.messages, getConversationName());
+  await saveScanBackup(resolved.messages, getConversationName());
   return `${resolved.messages.length} messages from ${resolved.source}`;
 }
 
@@ -1740,10 +1747,20 @@ function gceExportBackupFile(options = {}) {
   return new Promise((resolve, reject) => {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.json,application/json';
+    input.accept = '.json,.zip,application/json,application/zip';
     input.onchange = async () => {
       try {
-        const messages = JSON.parse(await input.files[0].text());
+        const file = input.files[0];
+        let text;
+        if (/\.zip$/i.test(file.name || '')) {
+          if (typeof JSZip !== 'function') throw new Error('Cannot open ZIP backups here; extract the .json file and pick that instead.');
+          const entry = Object.values((await JSZip.loadAsync(file)).files).find(f => !f.dir && /\.json$/i.test(f.name));
+          if (!entry) throw new Error('The backup ZIP does not contain a .json file.');
+          text = await entry.async('string');
+        } else {
+          text = await file.text();
+        }
+        const messages = JSON.parse(text);
         if (!Array.isArray(messages)) throw new Error('The backup file does not contain a message list.');
         resolve(await gceExportFromMemory(messages, options));
       } catch (err) {
