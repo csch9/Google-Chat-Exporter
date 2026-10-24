@@ -353,6 +353,9 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     let batches = 0;
     const MAX_BATCHES = 50000;
     const STABLE_BATCH_LIMIT = 8;
+    // Chat can keep re-rendering (height churn) at the history start; only real progress keeps the scan alive.
+    const NO_PROGRESS_LIMIT_MS = 90000;
+    let lastProgressAt = Date.now();
     let walkingBack = false;
 
     onProgress && onProgress('Scrolling up to load full history...');
@@ -388,6 +391,8 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
       const oldest = getOldestTimestamp();
       const curHeight = container.scrollHeight;
       const advanced = dedupMap.size > beforeCount || curHeight !== prevHeight || (oldest && oldest !== prevOldest);
+      if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest))) lastProgressAt = Date.now();
+      else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = 'idle'; break; }
 
       if (advanced) {
         stableBatches = 0;
