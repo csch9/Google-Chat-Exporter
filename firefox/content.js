@@ -1209,6 +1209,23 @@ function isSameConversationUrl(a, b) {
 
 const retryHint = () => retainedScan ? ` — ${retainedScan.history.messages.length} scanned messages are kept; export again to retry without rescanning.` : '';
 
+// Long scans are only held in this tab's memory; a file on disk survives reloads and can be fed to gceExportFromMemory().
+const SCAN_BACKUP_MIN_MESSAGES = 1000;
+function saveScanBackup(messages, conversationName) {
+  try {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(messages)], { type: 'application/json' }));
+    a.download = `${(conversationName || 'chat').replace(/[^a-zA-Z0-9._-]+/g, '_')}_scan-backup_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    console.log(`[Google Chat Exporter] saved scan backup ${a.download} (${messages.length} messages)`);
+  } catch (err) {
+    console.error('[Google Chat Exporter] could not save scan backup:', err);
+  }
+}
+
 // Resolves to 'done', 'empty', 'error', 'cancelled' or 'busy'.
 // A single runtime message is capped at 64 MiB, so large exports are staged in the background in chunks.
 async function sendPackage(format, payload) {
@@ -1304,6 +1321,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }
       throwIfAborted(signal);
       retainedScan = { url: initialUrl, dateFromTs, history: { ...history }, at: Date.now() };
+      if (history.messages.length >= SCAN_BACKUP_MIN_MESSAGES) saveScanBackup(history.messages, getConversationName());
       messages = history.messages;
       await sleep(200, signal);
     }
