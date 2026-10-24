@@ -168,7 +168,7 @@ test('large exports are staged in bounded chunks and discarded on failure', asyn
   assert.deepEqual(sent, ['stagePackageParts', 'discardStagedPackage']);
 });
 
-test('cancel during history restores position and disconnects its observer', async () => {
+test('stopping the history scan keeps collected messages, restores position and disconnects its observer', async () => {
   const c = loadContent();
   await c.loadSelectors();
   let disconnected = false;
@@ -176,15 +176,42 @@ test('cancel during history restores position and disconnects its observer', asy
   const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
     getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
   c.findScrollContainer = () => container;
-  c.extractMessages = () => [];
+  c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
   c.getOldestTimestamp = () => 1;
   const controller = new AbortController();
   const pending = c.scrollToLoadAll(null, 0, controller.signal);
   controller.abort();
-  await assert.rejects(pending, { name: 'AbortError' });
+  const result = await pending;
+  assert.equal(result.reason, 'stopped');
+  assert.match(result.warning, /stopped early/);
+  assert.deepEqual(Array.from(result.messages, m => m.text), ['a']);
   assert.equal(container.scrollTop, 800);
   assert.ok(disconnected);
 });
+
+test('first cancel during the scan exports collected messages without advancing the checkpoint', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async (_ms, signal) => c.throwIfAborted(signal);
+  let scanSignal;
+  c.scrollToLoadAll = (_progress, _cutoff, signal) => new Promise(resolve => {
+    scanSignal = signal;
+    signal.addEventListener('abort', () => resolve({ messages: [{ text: 'kept' }], reason: 'stopped', warning: 'stopped early' }));
+  });
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  const run = c.runExport({ format: 'txt' });
+  for (let i = 0; i < 30 && !scanSignal; i++) await Promise.resolve();
+  vm.runInContext('historyScanStop.abort()', c);
+  assert.equal(await run, 'done');
+  assert.deepEqual(Array.from(packaged.messages, m => m.text), ['kept']);
+  assert.equal(packaged.history.reason, 'stopped');
+  assert.equal(packaged.checkpoint, null);
+});
+
 
 test('collected history far below the viewport is detached by outermost wrapper and restored in place', async () => {
   const c = loadContent();

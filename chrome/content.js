@@ -80,6 +80,8 @@ function isInChatFrame() {
 let progressEl = null;
 let exportInProgress = false;
 let exportController = null;
+// Set while the history scan runs; aborting it stops scrolling but keeps the collected messages.
+let historyScanStop = null;
 
 function showProgress(text, percent, state = 'working') {
   if (!progressEl) {
@@ -193,7 +195,11 @@ function showProgress(text, percent, state = 'working') {
 
     document.documentElement.appendChild(progressEl);
     progressEl.querySelector('.gce-close').addEventListener('click', () => {
-      if (exportInProgress && exportController) {
+      if (exportInProgress && historyScanStop) {
+        showProgress('Stopping scan — exporting collected messages (click again to cancel)...', 15);
+        historyScanStop.abort();
+        historyScanStop = null;
+      } else if (exportInProgress && exportController) {
         showProgress('Cancelling export...', 0);
         exportController.abort();
       } else {
@@ -360,55 +366,61 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
 
     onProgress && onProgress('Scrolling up to load full history...');
 
-    while (batches < MAX_BATCHES) {
-      throwIfAborted(signal);
-      batches++;
+    try {
+      while (batches < MAX_BATCHES) {
+        throwIfAborted(signal);
+        batches++;
 
-      // Stop early if we've passed our date range
-      if (dateFromTs) {
+        // Stop early if we've passed our date range
+        if (dateFromTs) {
+          const oldest = getOldestTimestamp();
+          if (oldest && oldest < dateFromTs) {
+            onProgress && onProgress('Reached date range boundary — stopping scroll.');
+            reason = 'date-boundary';
+            break;
+          }
+        }
+
+        // Overlap viewports so virtualized messages are collected before eviction.
+        const beforeCount = dedupMap.size;
+        const previousTop = container.scrollTop;
+        const targetTop = Math.max(0, previousTop - Math.max(1, container.clientHeight * 0.75));
+        if (targetTop <= 1 && previousTop <= 1 && stableBatches > 0) {
+          if (walkingBack) walkingBack = false;
+          else if (await provokeHistoryLoad(container, stableBatches, signal)) { walkingBack = true; continue; }
+        }
+        const wait = waitForHistoryMutation(container, prevHeight, prevOldest,
+          targetTop > 1 ? 250 : Math.min(600 * (stableBatches + 1), 4000), signal, targetTop > 1);
+        container.scrollTop = targetTop;
+        await wait;
+        collectCurrent();
+
         const oldest = getOldestTimestamp();
-        if (oldest && oldest < dateFromTs) {
-          onProgress && onProgress('Reached date range boundary — stopping scroll.');
-          reason = 'date-boundary';
-          break;
+        const curHeight = container.scrollHeight;
+        const advanced = dedupMap.size > beforeCount || curHeight !== prevHeight || (oldest && oldest !== prevOldest);
+        if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest))) lastProgressAt = Date.now();
+        else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = 'idle'; break; }
+
+        if (advanced) {
+          stableBatches = 0;
+          walkingBack = false;
+          prevHeight = curHeight;
+          prevOldest = oldest;
+        } else if (container.scrollTop <= 1 && previousTop <= 1) {
+          stableBatches++;
+          if (stableBatches >= STABLE_BATCH_LIMIT) { reason = 'idle'; break; }
+        }
+        // Pruning shrinks scrollHeight; rebase so it is not mistaken for newly loaded history.
+        if (pruner.prune()) prevHeight = container.scrollHeight;
+
+        if (batches % 2 === 0) {
+          onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`);
         }
       }
-
-      // Overlap viewports so virtualized messages are collected before eviction.
-      const beforeCount = dedupMap.size;
-      const previousTop = container.scrollTop;
-      const targetTop = Math.max(0, previousTop - Math.max(1, container.clientHeight * 0.75));
-      if (targetTop <= 1 && previousTop <= 1 && stableBatches > 0) {
-        if (walkingBack) walkingBack = false;
-        else if (await provokeHistoryLoad(container, stableBatches, signal)) { walkingBack = true; continue; }
-      }
-      const wait = waitForHistoryMutation(container, prevHeight, prevOldest,
-        targetTop > 1 ? 250 : Math.min(600 * (stableBatches + 1), 4000), signal, targetTop > 1);
-      container.scrollTop = targetTop;
-      await wait;
-      collectCurrent();
-
-      const oldest = getOldestTimestamp();
-      const curHeight = container.scrollHeight;
-      const advanced = dedupMap.size > beforeCount || curHeight !== prevHeight || (oldest && oldest !== prevOldest);
-      if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest))) lastProgressAt = Date.now();
-      else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = 'idle'; break; }
-
-      if (advanced) {
-        stableBatches = 0;
-        walkingBack = false;
-        prevHeight = curHeight;
-        prevOldest = oldest;
-      } else if (container.scrollTop <= 1 && previousTop <= 1) {
-        stableBatches++;
-        if (stableBatches >= STABLE_BATCH_LIMIT) { reason = 'idle'; break; }
-      }
-      // Pruning shrinks scrollHeight; rebase so it is not mistaken for newly loaded history.
-      if (pruner.prune()) prevHeight = container.scrollHeight;
-
-      if (batches % 2 === 0) {
-        onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`);
-      }
+    } catch (err) {
+      // Aborting the scan signal means "stop scrolling"; the caller decides whether the whole export is cancelled.
+      if (err?.name !== 'AbortError') throw err;
+      reason = 'stopped';
     }
 
     collectCurrent(true);
@@ -417,8 +429,8 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
       scrollTop: container.scrollTop, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight,
       groups: document.querySelectorAll(SEL.messageGroups).length
     });
-    const warning = reason === 'date-boundary' ? '' : reason === 'limit'
-      ? 'History scan reached its safety limit; export may be incomplete.'
+    const warning = reason === 'limit' ? 'History scan reached its safety limit; export may be incomplete.'
+      : reason === 'stopped' ? 'History scan was stopped early; older messages are not included.'
       : '';
     onProgress && onProgress(warning ? `${dedupMap.size} messages collected. ${warning}` : `${dedupMap.size} messages collected.`);
 
@@ -1262,11 +1274,21 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     const dateFromTs = previous?.timestamp || (dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0);
 
     if (loadAll) {
-      history = await scrollToLoadAll(
-        (text) => showProgress(text, 15),
-        dateFromTs,
-        signal
-      );
+      const scanStop = new AbortController();
+      const forwardCancel = () => scanStop.abort();
+      signal.addEventListener('abort', forwardCancel, { once: true });
+      historyScanStop = scanStop;
+      try {
+        history = await scrollToLoadAll(
+          (text) => showProgress(text, 15),
+          dateFromTs,
+          scanStop.signal
+        );
+      } finally {
+        historyScanStop = null;
+        signal.removeEventListener('abort', forwardCancel);
+      }
+      throwIfAborted(signal);
       messages = history.messages;
       await sleep(200, signal);
     }
@@ -1347,7 +1369,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (initialUrl && !isSameConversationUrl(initialUrl, location.href)) {
       throw new Error('Conversation changed during export. Please retry.');
     }
-    const candidate = checkpointKey && loadAll && !mediaFailed && history.reason !== 'limit' && history.reason !== 'visible-only'
+    const candidate = checkpointKey && loadAll && !mediaFailed && !['limit', 'visible-only', 'stopped'].includes(history.reason)
       ? await buildCheckpoint(messages) : null;
     if (mediaFailed) history.warning = `${history.warning || ''} Some attachments failed; the checkpoint will not advance.`.trim();
     if (incremental && !candidate && !mediaFailed) history.warning = `${history.warning || ''} No safe checkpoint was saved; the next export may repeat messages.`.trim();
