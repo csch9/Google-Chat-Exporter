@@ -1314,7 +1314,7 @@ function isSameConversationUrl(a, b) {
 const retryHint = () => retainedScan ? ` — ${retainedScan.history.messages.length} scanned messages are kept; export again to retry without rescanning.` : '';
 
 // Long scans are only held in this tab's memory; a file on disk survives reloads and can be fed to gceExportFromMemory().
-const SCAN_BACKUP_MIN_MESSAGES = 1000;
+let SCAN_BACKUP_MIN_MESSAGES = 1000;
 // Media per ZIP part; each part's base64 must stay well under the ~512 Mi-char JS string limit in the background.
 let ZIP_PART_BASE64_BUDGET = 150_000_000;
 function saveScanBackup(messages, conversationName) {
@@ -1387,7 +1387,6 @@ async function hopToNextSegment(job, messages, target, options) {
   const next = { ...job, segments: job.segments + 1, collected: job.collected + messages.length,
     link: target.link, conversation: target.conversation, message: target.message, state: 'hop', at: Date.now() };
   await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: next });
-  if (scanOptions.scanBackup) saveScanBackup(messages, `${job.name || 'chat'}_segment${next.segments}`);
   console.log(`[Google Chat Exporter] segment ${next.segments} stored (${messages.length} messages, ~${next.collected} total); reopening at`, target.link);
   showProgress(`Segment ${next.segments} saved (~${next.collected} messages so far). Reopening Chat at the oldest message to continue...`, 15);
   const resp = await chrome.runtime.sendMessage({ action: 'navigateTab', url: target.link });
@@ -1450,6 +1449,9 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
   exportController = controller;
   const { signal } = controller;
   let originalPosition = null;
+  // Every message this run scanned (all segments included); saved once as a backup when the run ends.
+  let scanned = null;
+  let hopped = false;
 
   try {
     await loadSelectors();
@@ -1514,11 +1516,13 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         historyScanStop = null;
         signal.removeEventListener('abort', forwardCancel);
       }
+      scanned = history.messages;
       throwIfAborted(signal);
       if (history.reason === 'segment') {
         const target = oldestMessageLink();
         if (target) {
           await hopToNextSegment(segmentJob, history.messages, target, { format, includeMedia, dateFrom, loadAll: true });
+          hopped = true;
           return 'segment';
         }
         history.reason = 'limit';
@@ -1526,10 +1530,10 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }
       if (segmentJob) {
         history.messages = mergeMessages(...await loadSegments(segmentJob), history.messages);
+        scanned = history.messages;
         await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: { ...segmentJob, state: 'finished' } });
       }
       retainedScan = scanOptions.retryReuse ? { url: initialUrl, dateFromTs, history: { ...history }, at: Date.now() } : null;
-      if (scanOptions.scanBackup && history.messages.length >= SCAN_BACKUP_MIN_MESSAGES) saveScanBackup(history.messages, getConversationName());
       messages = history.messages;
       await sleep(200, signal);
     }
@@ -1687,6 +1691,17 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (originalPosition) restoreScrollPosition(originalPosition.container, originalPosition.distance, originalPosition.anchor);
     exportInProgress = false;
     exportController = null;
+    if (!hopped && scanOptions.scanBackup) await saveRunBackup(scanned, segmentJob);
+  }
+}
+
+// A segment page that fails before its own scan returns still has the earlier segments in storage.
+async function saveRunBackup(scanned, segmentJob) {
+  try {
+    const messages = segmentJob?.segments ? mergeMessages(...await loadSegments(segmentJob), scanned || []) : scanned;
+    if (messages?.length >= SCAN_BACKUP_MIN_MESSAGES) saveScanBackup(messages, getConversationName());
+  } catch (err) {
+    console.error('[Google Chat Exporter] could not save scan backup:', err);
   }
 }
 

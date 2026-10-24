@@ -114,7 +114,7 @@ All options are on by default except diagnostic logging. Options marked ⚠️ c
 | ⚠️ **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. The tab navigates on its own and ends at an old message; reload the chat afterwards. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
 | **Nudge History Loading** | Sends a scroll-up event as soon as the top is reached so Chat loads older messages sooner. | History loading misbehaves in your workspace. |
 | **Reuse Scan After a Failure** | A failed export keeps its messages and downloaded media; exporting again skips the rescan (the file notes when the scan was made). | You always want a fresh scan. |
-| **Save Scan Backup** | Downloads a JSON copy of scans with 1000+ messages before media download and packaging. | You don't want the extra file. |
+| **Save Scan Backup** | Downloads one JSON copy of scans with 1000+ messages when the export ends, whether it finished, failed or was cancelled. Segmented scans keep their segments in local storage in the meantime, so a long scan is never interrupted by downloads. | You don't want the extra file. |
 | **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | — |
 
 ### Disaster recovery from the console

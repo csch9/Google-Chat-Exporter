@@ -640,13 +640,15 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
     c.isInChatFrame = () => true;
     c.getConversationName = () => 'Fixture';
     c.showProgress = () => {};
-    c.saveScanBackup = () => {};
+    const backups = [];
+    c.saveScanBackup = messages => backups.push(Array.from(messages, m => m.text));
+    vm.runInContext('SCAN_BACKUP_MIN_MESSAGES = 1', c);
     c.sleep = async () => {};
     c.location = { href: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1' };
     c.document.querySelector = () => ({});
     c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1', conversation: 'SPACE' });
     c.scrollToLoadAll = async () => scan;
-    const sent = { navigations: [], packaged: null };
+    const sent = { navigations: [], packaged: null, backups };
     const pack = packageRecorder(payload => { sent.packaged = payload; return { success: true, filename: 'x.txt' }; });
     c.chrome.runtime.sendMessage = async msg => {
       if (msg.action === 'navigateTab') { sent.navigations.push(msg.url); return { success: true }; }
@@ -661,10 +663,12 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
   assert.deepEqual(first.sent.navigations, ['https://chat.google.com/app/chat/SPACE/topic/t1/message/t1']);
   assert.equal(store.gceSegmentJob.state, 'hop');
   assert.equal(first.sent.packaged, null, 'nothing is packaged before the last segment');
+  assert.deepEqual(first.sent.backups, [], 'no backup download while hopping between segments');
 
   const second = await page({ messages: [msg('a', 1), msg('b', 2)], reason: 'idle', warning: '' });
   assert.equal(await second.c.resumeSegmentJob(), 'done');
   assert.deepEqual(Array.from(second.sent.packaged.messages, m => m.text), ['a', 'b', 'c'], 'segments merged without the overlap');
+  assert.deepEqual(second.sent.backups, [['a', 'b', 'c']], 'one backup with every segment when the run ends');
   assert.deepEqual(Object.keys(store), [], 'stored segments are cleared after a successful export');
 });
 
