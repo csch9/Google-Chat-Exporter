@@ -17,6 +17,7 @@
     "contextMenus",
     "scripting",
     "storage",
+    "unlimitedStorage",
     "downloads"
   ],
   "host_permissions": [

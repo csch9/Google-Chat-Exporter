@@ -262,6 +262,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.action === 'navigateTab') {
+    // Segmented scans reopen the same tab at an older message.
+    if (!sender.tab?.id || !/^https:\/\/(chat|mail)\.google\.com\//.test(String(msg.url || ''))) {
+      sendResponse({ success: false, error: 'Invalid navigation target.' });
+      return false;
+    }
+    chrome.tabs.update(sender.tab.id, { url: msg.url })
+      .then(() => sendResponse({ success: true }), err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
   if (msg.action === 'cancelMediaBg') {
     mediaRequests.get(mediaRequestKey(sender, msg.requestId))?.abort();
     sendResponse({ success: true });

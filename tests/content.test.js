@@ -212,7 +212,6 @@ test('first cancel during the scan exports collected messages without advancing 
   assert.equal(packaged.checkpoint, null);
 });
 
-
 test('collected history far below the viewport is detached by outermost wrapper and restored in place', async () => {
   const c = loadContent();
   const sel = await c.loadSelectors();
@@ -261,7 +260,6 @@ test('collected history far below the viewport is detached by outermost wrapper 
   assert.deepEqual(list.children.map(n => n.name), original);
   assert.equal(pruner.count, 0);
 });
-
 
 test('anchor restoration handles prepended content and changed layout', async () => {
   const c = loadContent();
@@ -577,7 +575,6 @@ test('a failed export keeps its scan so the retry skips rescanning', async () =>
   assert.equal(scans, 2, 'a successful export clears the retained scan');
 });
 
-
 test('a failed HTML export keeps downloaded media for the retry', async () => {
   const c = loadContent();
   await c.loadSelectors();
@@ -598,7 +595,6 @@ test('a failed HTML export keeps downloaded media for the retry', async () => {
   assert.equal(packaged.mediaFiles.length, 1);
   assert.equal(packaged.messages[0].media[0]._localPath, packaged.mediaFiles[0].path);
 });
-
 
 test('HTML media is packaged one part per request and a failed part resumes without repeating earlier ones', async () => {
   const c = loadContent();
@@ -627,6 +623,67 @@ test('HTML media is packaged one part per request and a failed part resumes with
   ], 'index.html travels only with part 1, and part 1 is not repeated on retry');
 });
 
+test('long scans hop to a fresh page at the oldest message and the resumed page exports all segments', async () => {
+  const store = {};
+  const storage = {
+    async get(keys) {
+      if (keys == null) return { ...store };
+      return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+    },
+    async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+    async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+  };
+  const page = async (scan) => {
+    const c = loadContent();
+    await c.loadSelectors();
+    c.chrome.storage.local = storage;
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => 'Fixture';
+    c.showProgress = () => {};
+    c.saveScanBackup = () => {};
+    c.sleep = async () => {};
+    c.location = { href: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1' };
+    c.document.querySelector = () => ({});
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1', conversation: 'SPACE' });
+    c.scrollToLoadAll = async () => scan;
+    const sent = { navigations: [], packaged: null };
+    const pack = packageRecorder(payload => { sent.packaged = payload; return { success: true, filename: 'x.txt' }; });
+    c.chrome.runtime.sendMessage = async msg => {
+      if (msg.action === 'navigateTab') { sent.navigations.push(msg.url); return { success: true }; }
+      return pack(msg);
+    };
+    return { c, sent };
+  };
+  const msg = (key, ts) => ({ _dedupKey: key, text: key, absoluteTimestamp: ts });
+
+  const first = await page({ messages: [msg('b', 2), msg('c', 3)], reason: 'segment', warning: '' });
+  assert.equal(await first.c.runExport({ format: 'txt' }), 'segment');
+  assert.deepEqual(first.sent.navigations, ['https://chat.google.com/app/chat/SPACE/topic/t1/message/t1']);
+  assert.equal(store.gceSegmentJob.state, 'hop');
+  assert.equal(first.sent.packaged, null, 'nothing is packaged before the last segment');
+
+  const second = await page({ messages: [msg('a', 1), msg('b', 2)], reason: 'idle', warning: '' });
+  assert.equal(await second.c.resumeSegmentJob(), 'done');
+  assert.deepEqual(Array.from(second.sent.packaged.messages, m => m.text), ['a', 'b', 'c'], 'segments merged without the overlap');
+  assert.deepEqual(Object.keys(store), [], 'stored segments are cleared after a successful export');
+});
+
+test('oldest-message link follows the app URL, falling back to the copied-link format', async () => {
+  const c = loadContent();
+  const sel = await c.loadSelectors();
+  sel.attrs.groupId = 'data-id';
+  const attrs = { 'data-id': 'dV5wI_76Cgs', 'data-topic-id': 'dV5wI_76Cgs', 'data-group-synthetic-id': 'space/AAAAtnkdPQo' };
+  const inner = { getAttribute: name => attrs[name] ?? null };
+  const group = { getAttribute: name => name === 'data-id' ? attrs['data-id'] : null, closest: () => null,
+    querySelector: sel => (sel.slice(1, -1) in attrs ? inner : null) };
+  c.document.querySelector = () => group;
+  c.location = { href: 'https://chat.google.com/app/chat/AAAAtnkdPQo' };
+  assert.deepEqual({ ...c.oldestMessageLink() }, {
+    link: 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo' });
+  c.location = { href: 'https://mail.google.com/chat/u/0/#chat/space/AAAAtnkdPQo' };
+  assert.deepEqual({ ...c.oldestMessageLink() }, {
+    link: 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo' });
+});
 
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
   const c = loadContent();
@@ -647,7 +704,6 @@ test('console export packages on-page messages with media as a complete export, 
   assert.equal(packaged.history.reason, 'idle');
   assert.equal(packaged.history.warning, '');
 });
-
 
 test('conversation identity comes from the chat address', () => {
   const c = loadContent();
