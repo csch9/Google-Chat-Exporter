@@ -1483,6 +1483,21 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
   }
 }
 
+// Console entry point (select the extension's content-script context in DevTools):
+//   gceExportFromMemory()          -> retained scan if any, otherwise every message currently on the page
+//   gceExportFromMemory(messages)  -> an explicit array, e.g. parsed from a backup JSON
+// Runs the normal HTML + media export as a complete one, without scrolling.
+async function gceExportFromMemory(messages = null, { format = 'html', includeMedia = true } = {}) {
+  await loadSelectors();
+  let source = 'argument';
+  if (!messages && retainedScan?.history?.messages?.length) { messages = retainedScan.history.messages; source = 'retained scan'; }
+  if (!messages) { messages = extractMessages(); source = 'page'; }
+  console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${source} as ${format}${includeMedia ? ' + media' : ''}`);
+  const media = retainedScan?.history?.messages === messages ? retainedScan.media : undefined;
+  retainedScan = { url: location.href, dateFromTs: 0, history: { messages, reason: 'idle', warning: '' }, at: Date.now(), manual: true, media };
+  return runExport({ format, includeMedia, loadAll: true });
+}
+
 // ── Export Mode (auto-export on channel switch) ─────────────
 // The background owns the mode; this frame watches for conversation switches
 // and exports each newly opened conversation once it has rendered.

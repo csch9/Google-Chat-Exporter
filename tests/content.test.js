@@ -628,6 +628,27 @@ test('HTML media is packaged one part per request and a failed part resumes with
 });
 
 
+test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/u/0/frame' };
+  c.scrollToLoadAll = async () => { throw new Error('must not scroll'); };
+  c.extractMessages = () => [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png' }] }];
+  c.downloadMedia = async () => ({ success: true, base64: 'eA==', mimeType: 'image/png' });
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.zip' }; });
+  assert.equal(await c.gceExportFromMemory(), 'done');
+  assert.equal(packaged.messages.length, 1);
+  assert.equal(packaged.mediaFiles.length, 1);
+  assert.equal(packaged.history.reason, 'idle');
+  assert.equal(packaged.history.warning, '');
+});
+
+
 test('conversation identity comes from the chat address', () => {
   const c = loadContent();
   c.location = { href: 'https://chat.google.com/u/1/app/space/AAA123' };
