@@ -396,6 +396,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
 
   try {
     collectCurrent(true);
+    const startCount = dedupMap.size;
     let prevHeight = container.scrollHeight;
     let prevOldest = getOldestTimestamp();
     let stableBatches = 0;
@@ -538,7 +539,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
       : '';
     onProgress && onProgress(warning ? `${dedupMap.size} messages collected. ${warning}` : `${dedupMap.size} messages collected.`);
 
-    return { reason, warning, messages: [...dedupMap.values()].sort(
+    return { reason, warning, startCount, messages: [...dedupMap.values()].sort(
       (a, b) => (a.absoluteTimestamp || 0) - (b.absoluteTimestamp || 0)
     ) };
   } finally {
@@ -1348,6 +1349,9 @@ async function saveScanBackup(messages, conversationName) {
 // oldest collected message. Segments live in extension storage so they survive the navigation.
 const SEGMENT_JOB_KEY = 'gceSegmentJob';
 const SEGMENT_HOP_MAX_AGE_MS = 10 * 60 * 1000;
+// A reopened segment that gains fewer messages than this before going idle is treated as stalled, not as the start.
+let SEGMENT_STALL_MESSAGES = 50;
+const SEGMENT_STALL_RETRIES = 2;
 const segmentKey = (jobId, n) => `gceSegment:${jobId}:${n}`;
 
 // Returns { link, conversation } for the topmost (oldest) rendered message, or null.
@@ -1388,13 +1392,13 @@ async function clearSegmentJob(job) {
   await chrome.storage.local.remove([SEGMENT_JOB_KEY, ...Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n))]);
 }
 
-async function hopToNextSegment(job, messages, target, options) {
+async function hopToNextSegment(job, messages, target, options, retries = 0) {
   if (!job) {
     await clearSegmentJob(await readSegmentJob());
     job = { id: Date.now().toString(36), segments: 0, collected: 0, options, name: getConversationName() };
   }
   await chrome.storage.local.set({ [segmentKey(job.id, job.segments)]: messages });
-  const next = { ...job, segments: job.segments + 1, collected: job.collected + messages.length,
+  const next = { ...job, segments: job.segments + 1, collected: job.collected + messages.length, retries,
     link: target.link, conversation: target.conversation, message: target.message, state: 'hop', at: Date.now() };
   await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: next });
   console.log(`[Google Chat Exporter] segment ${next.segments} stored (${messages.length} messages, ~${next.collected} total); reopening at`, target.link);
@@ -1410,8 +1414,14 @@ async function resumeSegmentJob() {
   if (!(topFrameUrl() || location.href).includes(job.conversation)) return;
   for (let i = 0; i < 60 && !document.querySelector(SEL.messageGroups); i++) await sleep(500);
   if (!document.querySelector(SEL.messageGroups) || exportInProgress) return;
-  // Let Chat finish positioning on the linked message before scrolling.
-  await sleep(1500);
+  // Let Chat finish positioning on the linked message: wait until the rendered list stops growing.
+  let groups = -1;
+  for (let stable = 0, i = 0; stable < 3 && i < 12; i++) {
+    await sleep(500);
+    const now = document.querySelectorAll(SEL.messageGroups).length;
+    stable = now === groups ? stable + 1 : 0;
+    groups = now;
+  }
   await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: { ...job, state: 'running' } });
   // Some workspaces do not open message links; scanning from wherever Chat landed would loop, so export what is stored.
   if (job.message && !document.querySelector(`[${SEL.attrs.groupId}="${job.message}"]`)) {
@@ -1538,6 +1548,19 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         }
         history.reason = 'limit';
         history.warning = 'Could not reopen Chat at an older message to continue the scan; older messages may be missing.';
+      }
+      // A reopened page sometimes never loads older history; reopen elsewhere rather than mistake it for the start.
+      if (segmentJob && history.reason === 'idle' && history.messages.length - (history.startCount || 0) < SEGMENT_STALL_MESSAGES) {
+        const retries = segmentJob.retries || 0;
+        const target = oldestMessageLink();
+        if (target && retries < SEGMENT_STALL_RETRIES) {
+          console.warn(`[Google Chat Exporter] segment ${segmentJob.segments + 1} stalled after reopening; retrying at an older message (${retries + 1}/${SEGMENT_STALL_RETRIES})`);
+          await hopToNextSegment(segmentJob, history.messages, target, { format, includeMedia, dateFrom, loadAll: true }, retries + 1);
+          hopped = true;
+          return 'segment';
+        }
+        const oldest = history.messages.find(m => m.absoluteTimestamp)?.absoluteTimestamp;
+        history.warning = `Chat stopped loading older messages after reopening${oldest ? ` at ${new Date(oldest).toLocaleDateString()}` : ''}. If the conversation is older than that, turn off Segmented Scanning and export again for the full history.`;
       }
       if (segmentJob) {
         history.messages = mergeMessages(...await loadSegments(segmentJob), history.messages);

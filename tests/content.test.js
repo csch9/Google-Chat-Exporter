@@ -642,7 +642,7 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
     c.showProgress = () => {};
     const backups = [];
     c.saveScanBackup = messages => backups.push(Array.from(messages, m => m.text));
-    vm.runInContext('SCAN_BACKUP_MIN_MESSAGES = 1', c);
+    vm.runInContext('SCAN_BACKUP_MIN_MESSAGES = 1; SEGMENT_STALL_MESSAGES = 0', c);
     c.sleep = async () => {};
     c.location = { href: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1' };
     c.document.querySelector = () => ({});
@@ -739,6 +739,41 @@ test('scan backups are zipped when JSZip is loaded, and zipped backups can be ex
   await input.onchange();
   assert.equal(await pending, 'done');
   assert.deepEqual(Array.from(exported, m => m.text), ['z']);
+});
+
+test('a reopened segment that stalls is reopened elsewhere, then exported with a warning once retries run out', async () => {
+  const store = {};
+  const c = loadContent();
+  await c.loadSelectors();
+  c.chrome.storage.local = {
+    async get(keys) { return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]])); },
+    async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+    async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+  };
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.saveScanBackup = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/DM/topic/m1/message/m1' };
+  c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/DM/topic/m0/message/m0', conversation: 'DM', message: 'm0' });
+  const stalled = { messages: [{ _dedupKey: 'x', text: 'x', absoluteTimestamp: Date.UTC(2024, 0, 2) }], startCount: 1, reason: 'idle', warning: '' };
+  c.scrollToLoadAll = async () => stalled;
+  const navigations = [];
+  let packaged = null;
+  const pack = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? (navigations.push(msg.url), { success: true }) : pack(msg);
+  const job = { id: 'j', segments: 1, collected: 3000, options: { format: 'txt' }, retries: 0 };
+  store[`gceSegment:j:0`] = [{ _dedupKey: 'y', text: 'y', absoluteTimestamp: Date.UTC(2024, 5, 1) }];
+
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'segment');
+  assert.equal(navigations.length, 1);
+  assert.equal(store.gceSegmentJob.retries, 1);
+
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: { ...store.gceSegmentJob, retries: 2 } }), 'done');
+  assert.equal(navigations.length, 1, 'no further reopen once retries run out');
+  assert.match(packaged.history.warning, /stopped loading older messages/);
+  assert.deepEqual(Array.from(packaged.messages, m => m.text), ['x', 'y']);
 });
 
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
