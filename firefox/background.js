@@ -433,7 +433,7 @@ async function getSettings() {
 
 // ── TXT Packaging ───────────────────────────────────────────
 
-async function packageTxt({ conversationName, messages, exportDate, history }) {
+async function packageTxt({ conversationName, messages, exportDate, history, stats }) {
   const name = conversationName || 'Google Chat';
   const line = '─'.repeat(60);
   const header = [
@@ -446,6 +446,7 @@ async function packageTxt({ conversationName, messages, exportDate, history }) {
     `Exported:  ${new Date(exportDate).toLocaleString()}`,
     ...(history?.warning ? [`Warning:   ${history.warning}`] : []),
     ...(history?.since ? [`New since: ${new Date(history.since).toISOString()}`] : []),
+    ...statsHeaderLines(stats),
     '',
     line,
     ''
@@ -493,7 +494,7 @@ async function packageTxt({ conversationName, messages, exportDate, history }) {
 // JS strings cap near 512 Mi chars and the ZIP is built as base64, so media is split across volumes well below that.
 let ZIP_PART_BASE64_BUDGET = 200_000_000;
 
-async function packageHtml({ conversationName, messages, mediaFiles, exportDate, history, part }) {
+async function packageHtml({ conversationName, messages, mediaFiles, exportDate, history, part, stats }) {
   const name = conversationName || 'Google Chat';
   const parts = [[]];
   let size = 0;
@@ -514,6 +515,7 @@ async function packageHtml({ conversationName, messages, mediaFiles, exportDate,
     if (offset + i === 0) {
       zip.file('index.html', generateHtml({ conversationName: name, messages, exportDate, history }));
       zip.file('styles.css', generateCss());
+      if (stats) zip.file('export-info.json', JSON.stringify(stats, null, 2));
     }
     for (const file of parts[i]) zip.file(file.path, file.base64, { base64: true });
     const zipBase64 = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', compressionOptions: { level: 6 } });
@@ -826,6 +828,25 @@ function formatTextContent(text) {
 function fmtDur(ms) {
   const s = Math.round((ms || 0) / 1000);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function fmtElapsed(seconds) {
+  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
+  return h ? `${h}h ${m}m ${s}s` : m ? `${m}m ${s}s` : `${s}s`;
+}
+
+function statsHeaderLines(stats) {
+  if (!stats) return [];
+  const scan = stats.scan || {};
+  const scanLine = scan.seconds == null ? 'not scrolled (messages on the page or from memory)'
+    : `${fmtElapsed(scan.seconds)}, ${scan.segments} segment${scan.segments === 1 ? '' : 's'}` +
+      `${scan.stallRetries ? `, ${scan.stallRetries} stall retries` : ''}, ended: ${scan.reason}`;
+  return [
+    `Range:     ${stats.firstMessageAt || '?'} → ${stats.lastMessageAt || '?'}`,
+    `Scan:      ${scanLine}`,
+    `Total:     ${fmtElapsed(stats.exportSeconds || 0)}`,
+    `Exporter:  ${stats.extension} ${stats.extensionVersion}`
+  ];
 }
 
 function b64EncodeUtf8(str) {

@@ -805,6 +805,31 @@ test('a reopened page that barely loads anything gives up after fewer idle check
   assert.ok(await run(true) < await run(false));
 });
 
+test('exports carry stats about the version, message range and scan', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.chrome.runtime.getManifest = () => ({ version: '3.0.0' });
+  c.scrollToLoadAll = async () => ({ messages: [
+    { text: 'a', absoluteTimestamp: Date.UTC(2022, 7, 30) }, { text: 'b', absoluteTimestamp: Date.UTC(2026, 9, 24) }
+  ], reason: 'idle', warning: '' });
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  const { stats } = packaged;
+  assert.equal(stats.extensionVersion, '3.0.0');
+  assert.equal(stats.messages, 2);
+  assert.equal(stats.firstMessageAt, '2022-08-30T00:00:00.000Z');
+  assert.equal(stats.lastMessageAt, '2026-10-24T00:00:00.000Z');
+  assert.equal(stats.scan.reason, 'idle');
+  assert.equal(stats.scan.segments, 1);
+  assert.equal(typeof stats.scan.seconds, 'number');
+  assert.equal(stats.format, 'txt');
+});
+
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
   const c = loadContent();
   await c.loadSelectors();

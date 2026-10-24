@@ -75,6 +75,29 @@ test('large HTML exports are split into ZIP volumes below the string limit', asy
   assert.equal(result.downloadId, 3);
 });
 
+test('export stats go into the first ZIP part and the TXT header', async () => {
+  const context = loadBackground();
+  const zips = [];
+  context.JSZip = class {
+    constructor() { this.files = {}; zips.push(this); }
+    file(p, data) { this.files[p] = data; }
+    async generateAsync() { return 'eA=='; }
+  };
+  const urls = [];
+  context.chrome.downloads.download = (options, callback) => { urls.push(options.url); callback(urls.length); };
+  const stats = { extension: 'Google Chat Exporter', extensionVersion: '3.0.0', messages: 2, exportSeconds: 754,
+    firstMessageAt: '2022-08-30T10:00:00.000Z', lastMessageAt: '2026-10-24T10:00:00.000Z',
+    scan: { reason: 'idle', seconds: 720, segments: 3, stallRetries: 2 } };
+  await context.packageHtml({ conversationName: 'C', messages: [], mediaFiles: [], exportDate: new Date().toISOString(), history: {}, stats });
+  assert.equal(JSON.parse(zips[0].files['export-info.json']).extensionVersion, '3.0.0');
+
+  await context.packageTxt({ conversationName: 'C', messages: [], exportDate: new Date().toISOString(), history: {}, stats });
+  const text = Buffer.from(urls.at(-1).split(',')[1], 'base64').toString('utf8');
+  assert.match(text, /Scan: +12m 0s, 3 segments, 2 stall retries, ended: idle/);
+  assert.match(text, /Total: +12m 34s/);
+  assert.match(text, /Exporter: +Google Chat Exporter 3\.0\.0/);
+});
+
 test('safeResourceUrl permits HTTPS and safe packaged media paths', () => {
   const context = loadBackground();
   assert.equal(context.safeResourceUrl('https://example.com/a.png'), 'https://example.com/a.png');

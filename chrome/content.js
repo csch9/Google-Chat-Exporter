@@ -1408,10 +1408,11 @@ async function clearSegmentJob(job) {
 async function hopToNextSegment(job, messages, target, options, retries = 0) {
   if (!job) {
     await clearSegmentJob(await readSegmentJob());
-    job = { id: Date.now().toString(36), segments: 0, collected: 0, options, name: getConversationName() };
+    job = { id: Date.now().toString(36), segments: 0, collected: 0, options, name: getConversationName(), startedAt: options.startedAt || Date.now() };
   }
   await chrome.storage.local.set({ [segmentKey(job.id, job.segments)]: messages });
   const next = { ...job, segments: job.segments + 1, collected: job.collected + messages.length, retries,
+    stallRetries: (job.stallRetries || 0) + (retries ? 1 : 0),
     link: target.link, conversation: target.conversation, message: target.message, state: 'hop', at: Date.now() };
   await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: next });
   console.log(`[Google Chat Exporter] segment ${next.segments} stored (${messages.length} messages, ~${next.collected} total); reopening at`, target.link);
@@ -1485,6 +1486,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
   // Every message this run scanned (all segments included); saved once as a backup when the run ends.
   let scanned = null;
   let hopped = false;
+  const runStartedAt = Date.now();
 
   try {
     await loadSelectors();
@@ -1555,7 +1557,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       if (history.reason === 'segment') {
         const target = oldestMessageLink();
         if (target) {
-          await hopToNextSegment(segmentJob, history.messages, target, { format, includeMedia, dateFrom, loadAll: true });
+          await hopToNextSegment(segmentJob, history.messages, target, { format, includeMedia, dateFrom, loadAll: true, startedAt: runStartedAt });
           hopped = true;
           return 'segment';
         }
@@ -1583,6 +1585,12 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         scanned = history.messages;
         await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: { ...segmentJob, state: 'finished' } });
       }
+      history.scanStats = {
+        startedAt: new Date(segmentJob?.startedAt || runStartedAt).toISOString(),
+        seconds: Math.round((Date.now() - (segmentJob?.startedAt || runStartedAt)) / 1000),
+        segments: segmentJob ? segmentJob.segments + 1 : 1,
+        stallRetries: segmentJob?.stallRetries || 0
+      };
       retainedScan = scanOptions.retryReuse ? { url: initialUrl, dateFromTs, history: { ...history }, at: Date.now() } : null;
       messages = history.messages;
       await sleep(200, signal);
@@ -1684,6 +1692,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     // Send to background for packaging & download
     const historyInfo = { reason: history.reason, warning: history.warning, since: history.since };
     const checkpoint = candidate ? { key: checkpointKey, value: candidate } : null;
+    const stats = buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt });
     let resp;
     if (format === 'html') {
       // One request per ZIP part: a single long request gets the service worker killed (~5 min limit) and holds all media at once.
@@ -1701,7 +1710,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         showProgress(`📦 Packaging part ${i + 1}/${chunks.length}...`, 88 + Math.round((i / chunks.length) * 11));
         const last = i === chunks.length - 1;
         resp = await sendPackage(format, {
-          conversationName, messages: i === 0 ? messages : [], mediaFiles: chunks[i], exportDate, sourceUrl,
+          conversationName, messages: i === 0 ? messages : [], mediaFiles: chunks[i], exportDate, sourceUrl, stats,
           history: historyInfo, checkpoint: last ? checkpoint : null, part: { index: i, count: chunks.length }
         });
         if (!resp?.success) break;
@@ -1710,7 +1719,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }
       if (resp?.success) resp = { ...resp, filename: filenames.join(', '), parts: chunks.length };
     } else {
-      resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: historyInfo, checkpoint });
+      resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, stats, history: historyInfo, checkpoint });
     }
       if (resp && resp.success) {
         retainedScan = null;
@@ -1743,6 +1752,34 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     exportController = null;
     if (!hopped && scanOptions.scanBackup) await saveRunBackup(scanned, segmentJob);
   }
+}
+
+// Packaged as export-info.json (HTML) or the TXT header so exports can be compared later.
+function buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt }) {
+  const times = messages.map(m => m.absoluteTimestamp).filter(Boolean);
+  const iso = ms => ms ? new Date(ms).toISOString() : null;
+  const first = times.reduce((a, b) => Math.min(a, b), Infinity);
+  const last = times.reduce((a, b) => Math.max(a, b), 0);
+  return {
+    extension: 'Google Chat Exporter',
+    extensionVersion: chrome.runtime.getManifest?.()?.version || '',
+    exportedAt: exportDate,
+    conversation: conversationName,
+    format: format === 'html' ? (includeMedia ? 'html+media' : 'html') : 'txt',
+    messages: messages.length,
+    firstMessageAt: iso(times.length ? first : 0),
+    lastMessageAt: iso(last),
+    scan: {
+      reason: history.reason,
+      warning: history.warning || '',
+      // Present only when this run (or the reused scan) scrolled history; null for page-only or console exports.
+      ...(history.scanStats || { startedAt: null, seconds: null, segments: 0, stallRetries: 0 })
+    },
+    exportSeconds: Math.round((Date.now() - runStartedAt) / 1000),
+    media: format === 'html' && includeMedia ? { files: mediaFiles.length, someFailed: !!mediaFailed } : null,
+    options: { ...scanOptions },
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : ''
+  };
 }
 
 // A segment page that fails before its own scan returns still has the earlier segments in storage.
