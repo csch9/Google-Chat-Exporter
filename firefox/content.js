@@ -497,7 +497,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
         timing.pruned += pruned;
 
         if (diagnostics && batches % 10 === 0) {
-          console.log('[Google Chat Exporter] scan timing (last 10 batches, ms)', {
+          console.log('[Google Chat Exporter] scan timing', {
             batches, messages: dedupMap.size, total: Date.now() - timing.since,
             wait: timing.wait, collect: timing.collect, prune: timing.prune, prunedNow: timing.pruned,
             scrollHeight: container.scrollHeight,
