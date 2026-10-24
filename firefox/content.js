@@ -230,6 +230,75 @@ function hideProgress() {
 
 // ── Scroll to Load All Messages ─────────────────────────────
 
+// Viewports of already-collected history kept attached below the visible area.
+const PRUNE_BUFFER_VIEWPORTS = 3;
+
+// Chat never evicts loaded history and DOM operations degrade with its size, so collected history is
+// detached during the scan. Each contiguous sibling run sits behind one comment marker: marker -> nodes (bottom-up).
+function createHistoryPruner(container) {
+  const runs = new Map();
+  let count = 0;
+  // Date of the topmost detached separator; stands in for it when no attached separator remains.
+  let leadingDate = '';
+  return {
+    get count() { return count; },
+    get leadingDate() { return leadingDate; },
+    prune() {
+      const items = container.querySelectorAll(`${SEL.dateSeparator}, ${SEL.messageGroups}`);
+      if (!items.length) return 0;
+      const limit = container.getBoundingClientRect().bottom + container.clientHeight * PRUNE_BUFFER_VIEWPORTS;
+      // Read all positions before writing so the pass forces a single layout.
+      let cut = items.length;
+      while (cut > 0 && items[cut - 1].getBoundingClientRect().top > limit) cut--;
+      if (cut === items.length) return 0;
+      // Per-message wrappers keep their height and nodes, so detach the outermost ancestor that lies wholly below the limit.
+      const roots = [];
+      let groups = 0;
+      let topDate = '';
+      for (let i = cut; i < items.length; i++) {
+        const item = items[i];
+        if (item.matches(SEL.dateSeparator)) topDate ||= cleanText(item.textContent);
+        else groups++;
+        let root = item;
+        while (root.parentElement && root.parentElement !== container &&
+          root.parentElement.getBoundingClientRect().top > limit) root = root.parentElement;
+        if (roots[roots.length - 1] !== root) roots.push(root);
+      }
+      if (topDate) leadingDate = topDate;
+      for (let i = roots.length - 1; i >= 0; i--) {
+        const root = roots[i];
+        const run = runs.get(root.nextSibling);
+        if (run) {
+          // Directly above an existing marker, so the marker already holds this position.
+          root.remove();
+          run.push(root);
+        } else {
+          const marker = document.createComment('gce-pruned');
+          root.replaceWith(marker);
+          runs.set(marker, [root]);
+        }
+      }
+      count += groups;
+      return groups;
+    },
+    restore() {
+      let lost = 0;
+      // Newest first: a later, outer root may contain markers of earlier runs, which only reconnect once it is back.
+      for (const [marker, nodes] of [...runs].reverse()) {
+        const fragment = document.createDocumentFragment();
+        // Chat may have reused a node elsewhere; leave those where they are.
+        for (let i = nodes.length - 1; i >= 0; i--) if (!nodes[i].isConnected) fragment.appendChild(nodes[i]);
+        if (marker.isConnected) marker.replaceWith(fragment);
+        else lost += fragment.childNodes.length;
+      }
+      runs.clear();
+      count = 0;
+      if (lost) console.warn(`[Google Chat Exporter] ${lost} detached messages could not be reattached (Chat re-rendered their container). Reload the tab before exporting from the page again.`);
+      return lost;
+    }
+  };
+}
+
 function findScrollContainer() {
   for (const sel of SEL.scrollContainers) {
     const el = document.querySelector(sel);
@@ -262,6 +331,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
   );
   const anchor = captureScrollAnchor(container);
   const extractionCache = createExtractionCache(container);
+  const pruner = createHistoryPruner(container);
   let reason = 'limit';
 
   const dedupMap = new Map();
@@ -269,7 +339,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     // No DOM mutations since the last pass means extraction would return the same messages.
     const hasChanges = extractionCache.changed();
     if (!force && !hasChanges) return;
-    for (const msg of extractMessages(extractionCache)) {
+    for (const msg of extractMessages(extractionCache, pruner.leadingDate)) {
       const key = msg._dedupKey || `${msg.sender}|${msg.absoluteTimestamp}|${(msg.text || '').slice(0, 80)}`;
       dedupMap.set(key, msg);
     }
@@ -328,6 +398,8 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
         stableBatches++;
         if (stableBatches >= STABLE_BATCH_LIMIT) { reason = 'idle'; break; }
       }
+      // Pruning shrinks scrollHeight; rebase so it is not mistaken for newly loaded history.
+      if (pruner.prune()) prevHeight = container.scrollHeight;
 
       if (batches % 2 === 0) {
         onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`);
@@ -350,6 +422,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     ) };
   } finally {
     extractionCache.disconnect();
+    pruner.restore();
     restoreScrollPosition(container, distanceFromBottom, anchor);
   }
 }
@@ -520,7 +593,7 @@ function createExtractionCache(container) {
   };
 }
 
-function extractMessages(cache = null) {
+function extractMessages(cache = null, leadingDate = '') {
   const results = [];
   const seen = new Set();
 
@@ -534,6 +607,7 @@ function extractMessages(cache = null) {
     date = cleanText(el.textContent);
     if (date) break;
   }
+  if (!date) date = leadingDate;
   for (const group of nodes) {
     if (isSeparator(group)) {
       const text = cleanText(group.textContent);

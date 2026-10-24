@@ -186,6 +186,56 @@ test('cancel during history restores position and disconnects its observer', asy
   assert.ok(disconnected);
 });
 
+test('collected history far below the viewport is detached by outermost wrapper and restored in place', async () => {
+  const c = loadContent();
+  const sel = await c.loadSelectors();
+  sel.dateSeparator = '.sep';
+  sel.messageGroups = '.group';
+  // Minimal DOM: container > list > (row > group | separator); enough for the pruner's node operations.
+  const container = { clientHeight: 400, getBoundingClientRect: () => ({ bottom: 400 }) };
+  const node = (name, top = 0, parent = null) => {
+    const n = {
+      name, top, parent, children: [], textContent: name === 'sep' ? 'Monday' : '',
+      get parentElement() { return this.parent; },
+      matches: sel => sel === '.sep' && name === 'sep',
+      getBoundingClientRect: () => ({ top }),
+      get isConnected() { return !!this.parent && (this.parent === container || this.parent.isConnected); },
+      get nextSibling() { return this.parent?.children ? this.parent.children[this.parent.children.indexOf(this) + 1] || null : null; },
+      remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; },
+      appendChild(child) { child.remove(); child.parent = this; this.children.push(child); },
+      replaceWith(other) {
+        const list = this.parent.children;
+        const incoming = other.name === '#fragment' ? other.children.splice(0) : (other.remove(), [other]);
+        incoming.forEach(x => { x.parent = this.parent; });
+        list.splice(list.indexOf(this), 1, ...incoming);
+        this.parent = null;
+      }
+    };
+    if (parent) parent.children.push(n);
+    return n;
+  };
+  const list = node('list', 0, null);
+  list.parent = container;
+  const row = (name, top) => { const r = node(`row-${name}`, top, list); node(name, top, r); return r; };
+  row('g0', 100); row('g1', 500); row('g2', 2500); node('sep', 2900, list); row('g3', 3000); row('g4', 4000);
+  const original = list.children.map(n => n.name);
+  container.querySelectorAll = () => list.children.filter(n => n.name !== '#comment')
+    .map(n => n.name === 'sep' ? n : n.children[0]);
+  c.document.createComment = () => node('#comment');
+  c.document.createDocumentFragment = () => node('#fragment');
+  const pruner = c.createHistoryPruner(container);
+  assert.equal(pruner.prune(), 3, 'counts message groups only');
+  assert.deepEqual(list.children.map(n => n.name), ['row-g0', 'row-g1', '#comment'],
+    'wrappers and separators below the buffer go behind one marker');
+  assert.equal(pruner.leadingDate, 'Monday');
+  assert.equal(pruner.prune(), 0, 'buffer content stays attached');
+  assert.equal(pruner.count, 3);
+  assert.equal(pruner.restore(), 0);
+  assert.deepEqual(list.children.map(n => n.name), original);
+  assert.equal(pruner.count, 0);
+});
+
+
 test('anchor restoration handles prepended content and changed layout', async () => {
   const c = loadContent();
   await c.loadSelectors();
