@@ -1211,6 +1211,8 @@ const retryHint = () => retainedScan ? ` — ${retainedScan.history.messages.len
 
 // Long scans are only held in this tab's memory; a file on disk survives reloads and can be fed to gceExportFromMemory().
 const SCAN_BACKUP_MIN_MESSAGES = 1000;
+// Media per ZIP part; each part's base64 must stay well under the ~512 Mi-char JS string limit in the background.
+let ZIP_PART_BASE64_BUDGET = 150_000_000;
 function saveScanBackup(messages, conversationName) {
   try {
     const a = document.createElement('a');
@@ -1403,6 +1405,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       // Media downloads can take hours; keep them with the scan so a packaging failure can be retried.
       if (retainedScan && retainedScan.history.messages === history.messages) {
         retainedScan.media = { files: mediaFiles, failed: mediaFailed };
+        retainedScan.partsDone = 0;
       }
     }
 
@@ -1419,12 +1422,42 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     exportController = null;
 
     // Send to background for packaging & download
-    const resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: { reason: history.reason, warning: history.warning, since: history.since }, checkpoint: candidate ? { key: checkpointKey, value: candidate } : null });
+    const historyInfo = { reason: history.reason, warning: history.warning, since: history.since };
+    const checkpoint = candidate ? { key: checkpointKey, value: candidate } : null;
+    let resp;
+    if (format === 'html') {
+      // One request per ZIP part: a single long request gets the service worker killed (~5 min limit) and holds all media at once.
+      const chunks = [[]];
+      let size = 0;
+      for (const file of mediaFiles) {
+        if (size && size + file.base64.length > ZIP_PART_BASE64_BUDGET) { chunks.push([]); size = 0; }
+        chunks[chunks.length - 1].push(file);
+        size += file.base64.length;
+      }
+      const resumable = retainedScan?.media?.files === mediaFiles;
+      const first = resumable ? retainedScan.partsDone || 0 : 0;
+      const filenames = [];
+      for (let i = first; i < chunks.length; i++) {
+        showProgress(`📦 Packaging part ${i + 1}/${chunks.length}...`, 88 + Math.round((i / chunks.length) * 11));
+        const last = i === chunks.length - 1;
+        resp = await sendPackage(format, {
+          conversationName, messages: i === 0 ? messages : [], mediaFiles: chunks[i], exportDate, sourceUrl,
+          history: historyInfo, checkpoint: last ? checkpoint : null, part: { index: i, count: chunks.length }
+        });
+        if (!resp?.success) break;
+        filenames.push(resp.filename);
+        if (resumable) retainedScan.partsDone = i + 1;
+      }
+      if (resp?.success) resp = { ...resp, filename: filenames.join(', '), parts: chunks.length };
+    } else {
+      resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: historyInfo, checkpoint });
+    }
       if (resp && resp.success) {
         retainedScan = null;
+        const parts = resp.parts > 1 ? ` Extract all ${resp.parts} parts into the same folder.` : '';
         const next = auto ? ' Auto-export: open the next channel.' : '';
-        showProgress(`Saved as ${resp.filename}. ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');
-        if (!history.warning) setTimeout(hideProgress, 4000);
+        showProgress(`Saved as ${resp.filename}.${parts} ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');
+        if (!history.warning && !parts) setTimeout(hideProgress, 4000);
         return 'done';
       } else {
         console.error('[Google Chat Exporter] Packaging failed:', resp?.error || resp);

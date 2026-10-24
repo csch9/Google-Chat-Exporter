@@ -55,6 +55,26 @@ function loadBackground() {
   return context;
 }
 
+test('large HTML exports are split into ZIP volumes below the string limit', async () => {
+  const context = loadBackground();
+  const zips = [];
+  context.JSZip = class {
+    constructor() { this.paths = []; zips.push(this); }
+    file(p) { this.paths.push(p); }
+    async generateAsync() { return 'eA=='; }
+  };
+  const downloads = [];
+  context.chrome.downloads.download = (options, callback) => { downloads.push(options.filename); callback(downloads.length); };
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', context);
+  const mediaFiles = ['a', 'b', 'c'].map(n => ({ path: `media/${n}`, base64: 'x'.repeat(6) }));
+  const result = await context.packageHtml({ conversationName: 'Big', messages: [], mediaFiles, exportDate: new Date().toISOString(), history: {} });
+  assert.equal(result.parts, 3);
+  assert.deepEqual(zips.map(z => z.paths), [['index.html', 'styles.css', 'media/a'], ['media/b'], ['media/c']]);
+  assert.equal(downloads.length, 3);
+  assert.match(downloads[0], /_part1of3\.zip$/);
+  assert.equal(result.downloadId, 3);
+});
+
 test('safeResourceUrl permits HTTPS and safe packaged media paths', () => {
   const context = loadBackground();
   assert.equal(context.safeResourceUrl('https://example.com/a.png'), 'https://example.com/a.png');

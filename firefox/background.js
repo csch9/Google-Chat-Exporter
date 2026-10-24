@@ -479,28 +479,38 @@ async function packageTxt({ conversationName, messages, exportDate, history }) {
 
 // ── HTML + ZIP Packaging ────────────────────────────────────
 
-async function packageHtml({ conversationName, messages, mediaFiles, exportDate, history }) {
+// JS strings cap near 512 Mi chars and the ZIP is built as base64, so media is split across volumes well below that.
+let ZIP_PART_BASE64_BUDGET = 200_000_000;
+
+async function packageHtml({ conversationName, messages, mediaFiles, exportDate, history, part }) {
   const name = conversationName || 'Google Chat';
-  const zip = new JSZip();
-
-  const htmlContent = generateHtml({ conversationName: name, messages, exportDate, history });
-  const cssContent = generateCss();
-
-  zip.file('index.html', htmlContent);
-  zip.file('styles.css', cssContent);
-
-  if (mediaFiles && mediaFiles.length > 0) {
-    for (const file of mediaFiles) {
-      zip.file(file.path, file.base64, { base64: true });
-    }
+  const parts = [[]];
+  let size = 0;
+  for (const file of mediaFiles || []) {
+    if (size && size + file.base64.length > ZIP_PART_BASE64_BUDGET) { parts.push([]); size = 0; }
+    parts[parts.length - 1].push(file);
+    size += file.base64.length;
   }
+  // The content script sends one request per part; index.html only goes into the first.
+  const offset = part ? part.index : 0;
+  const count = part ? Math.max(part.count, offset + parts.length) : parts.length;
 
-  const zipBase64 = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-  const filename = `${sanitize(name)}_${dateStr()}.zip`;
-  const dataUrl = 'data:application/zip;base64,' + zipBase64;
-
-  const downloadId = await triggerDownload(dataUrl, filename);
-  return { filename, downloadId };
+  const base = `${sanitize(name)}_${dateStr()}`;
+  const filenames = [];
+  let downloadId;
+  for (let i = 0; i < parts.length; i++) {
+    const zip = new JSZip();
+    if (offset + i === 0) {
+      zip.file('index.html', generateHtml({ conversationName: name, messages, exportDate, history }));
+      zip.file('styles.css', generateCss());
+    }
+    for (const file of parts[i]) zip.file(file.path, file.base64, { base64: true });
+    const zipBase64 = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    const filename = count > 1 ? `${base}_part${offset + i + 1}of${count}.zip` : `${base}.zip`;
+    downloadId = await triggerDownload('data:application/zip;base64,' + zipBase64, filename);
+    filenames.push(filename);
+  }
+  return { filename: filenames.join(', '), downloadId, parts: count };
 }
 
 // ── HTML Generator ──────────────────────────────────────────

@@ -600,6 +600,34 @@ test('a failed HTML export keeps downloaded media for the retry', async () => {
 });
 
 
+test('HTML media is packaged one part per request and a failed part resumes without repeating earlier ones', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', c);
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b', 'c'].map(n => ({ text: n, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'x'.repeat(6), mimeType: 'image/png' });
+  const parts = [];
+  let failAt = 1;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    if (payload.part.index === failAt) return { success: false, error: 'killed' };
+    parts.push({ index: payload.part.index, count: payload.part.count, messages: payload.messages.length, media: payload.mediaFiles.length });
+    return { success: true, filename: `p${payload.part.index + 1}.zip` };
+  });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  failAt = -1;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.deepEqual(parts, [
+    { index: 0, count: 3, messages: 3, media: 1 },
+    { index: 1, count: 3, messages: 0, media: 1 },
+    { index: 2, count: 3, messages: 0, media: 1 }
+  ], 'index.html travels only with part 1, and part 1 is not repeated on retry');
+});
+
+
 test('conversation identity comes from the chat address', () => {
   const c = loadContent();
   c.location = { href: 'https://chat.google.com/u/1/app/space/AAA123' };
