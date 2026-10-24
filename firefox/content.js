@@ -82,6 +82,8 @@ let exportInProgress = false;
 let exportController = null;
 // Set while the history scan runs; aborting it stops scrolling but keeps the collected messages.
 let historyScanStop = null;
+// Last scan whose export did not complete, so a retry can skip rescanning: { url, dateFromTs, history, at }.
+let retainedScan = null;
 
 function showProgress(text, percent, state = 'working') {
   if (!progressEl) {
@@ -1205,6 +1207,8 @@ function isSameConversationUrl(a, b) {
   }
 }
 
+const retryHint = () => retainedScan ? ` — ${retainedScan.history.messages.length} scanned messages are kept; export again to retry without rescanning.` : '';
+
 // Resolves to 'done', 'empty', 'error', 'cancelled' or 'busy'.
 // A single runtime message is capped at 64 MiB, so large exports are staged in the background in chunks.
 async function sendPackage(format, payload) {
@@ -1273,7 +1277,17 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     let history = { reason: 'visible-only', warning: 'Only currently rendered messages were requested.' };
     const dateFromTs = previous?.timestamp || (dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0);
 
-    if (loadAll) {
+    let reusedMedia = null;
+    if (loadAll && retainedScan && retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
+      history = { ...retainedScan.history };
+      // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
+      history.warning = retainedScan.manual ? (history.warning || '')
+        : `${history.warning || ''} Reused the history scan from ${new Date(retainedScan.at).toLocaleString()}; later messages are not included.`.trim();
+      if (format === 'html' && includeMedia && retainedScan.media) reusedMedia = retainedScan.media;
+      else history.messages.forEach(m => (m.media || []).forEach(x => { delete x._localPath; }));
+      showProgress(`Reusing ${history.messages.length} messages from the previous unfinished export...`, 15);
+      messages = history.messages;
+    } else if (loadAll) {
       const scanStop = new AbortController();
       const forwardCancel = () => scanStop.abort();
       signal.addEventListener('abort', forwardCancel, { once: true });
@@ -1289,6 +1303,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         signal.removeEventListener('abort', forwardCancel);
       }
       throwIfAborted(signal);
+      retainedScan = { url: initialUrl, dateFromTs, history: { ...history }, at: Date.now() };
       messages = history.messages;
       await sleep(200, signal);
     }
@@ -1312,6 +1327,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (previous) history.since = previous.timestamp;
 
     if (!messages || messages.length === 0) {
+      retainedScan = null;
       showProgress(previous ? `No new messages found since the previous export. ${history.warning || ''}` : 'No messages found. Try opening a conversation first.', 100, previous ? 'done' : 'error');
       setTimeout(hideProgress, 5000);
       exportInProgress = false;
@@ -1325,7 +1341,11 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     let mediaFiles = [];
     let mediaFailed = false;
 
-    if (format === 'html' && includeMedia) {
+    if (format === 'html' && includeMedia && reusedMedia) {
+      mediaFiles = reusedMedia.files;
+      mediaFailed = reusedMedia.failed;
+      showProgress(`Reusing ${mediaFiles.length} downloaded attachments...`, 85);
+    } else if (format === 'html' && includeMedia) {
       // Download all media
       let totalMedia = 0;
       messages.forEach(m => { totalMedia += (m.media || []).filter(x => x.url).length; });
@@ -1362,6 +1382,10 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }));
       const failure = results.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
+      // Media downloads can take hours; keep them with the scan so a packaging failure can be retried.
+      if (retainedScan && retainedScan.history.messages === history.messages) {
+        retainedScan.media = { files: mediaFiles, failed: mediaFailed };
+      }
     }
 
     showProgress('📦 Packaging...', 88);
@@ -1379,13 +1403,14 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     // Send to background for packaging & download
     const resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: { reason: history.reason, warning: history.warning, since: history.since }, checkpoint: candidate ? { key: checkpointKey, value: candidate } : null });
       if (resp && resp.success) {
+        retainedScan = null;
         const next = auto ? ' Auto-export: open the next channel.' : '';
         showProgress(`Saved as ${resp.filename}. ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');
         if (!history.warning) setTimeout(hideProgress, 4000);
         return 'done';
       } else {
-        showProgress('❌ Export failed: ' + (resp?.error || 'Unknown error'), 0, 'error');
-        setTimeout(hideProgress, 6000);
+        console.error('[Google Chat Exporter] Packaging failed:', resp?.error || resp);
+        showProgress('❌ Export failed: ' + (resp?.error || 'Unknown error') + retryHint(), 0, 'error');
         return 'error';
       }
 
@@ -1397,9 +1422,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       setTimeout(hideProgress, 2500);
       return 'cancelled';
     }
-    console.error('[GCE] Export error:', err);
-    showProgress('❌ Export failed: ' + err.message, 0, 'error');
-    setTimeout(hideProgress, 6000);
+    console.error('[Google Chat Exporter] Export error:', err);
+    showProgress('❌ Export failed: ' + err.message + retryHint(), 0, 'error');
     return 'error';
   } finally {
     if (originalPosition) restoreScrollPosition(originalPosition.container, originalPosition.distance, originalPosition.anchor);

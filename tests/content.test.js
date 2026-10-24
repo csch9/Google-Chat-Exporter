@@ -558,6 +558,48 @@ test('incremental export establishes baseline, exports new files, then reports n
   assert.equal(Object.keys(stored).length, 2);
 });
 
+test('a failed export keeps its scan so the retry skips rescanning', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let scans = 0;
+  c.scrollToLoadAll = async () => { scans++; return { messages: [{ text: 'kept' }], reason: 'idle', warning: '' }; };
+  let fail = true;
+  c.chrome.runtime.sendMessage = packageRecorder(() => fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' });
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 1, 'retry reused the retained scan');
+  await c.runExport({ format: 'txt' });
+  assert.equal(scans, 2, 'a successful export clears the retained scan');
+});
+
+
+test('a failed HTML export keeps downloaded media for the retry', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.scrollToLoadAll = async () => ({ messages: [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png' }] }], reason: 'idle', warning: '' });
+  let downloads = 0;
+  c.downloadMedia = async () => { downloads++; return { success: true, base64: 'eA==', mimeType: 'image/png' }; };
+  let fail = true;
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'Invalid string length' } : { success: true, filename: 'x.zip' }; });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.equal(downloads, 1, 'media is not downloaded again');
+  assert.equal(packaged.mediaFiles.length, 1);
+  assert.equal(packaged.messages[0].media[0]._localPath, packaged.mediaFiles[0].path);
+});
+
+
 test('conversation identity comes from the chat address', () => {
   const c = loadContent();
   c.location = { href: 'https://chat.google.com/u/1/app/space/AAA123' };
