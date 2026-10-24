@@ -106,12 +106,12 @@ Clicking **×** on the progress box while history is loading stops the scan and 
 
 ### Advanced scan options
 
-All options are on by default except diagnostic logging.
+All options are on by default except diagnostic logging. Options marked ⚠️ change the Chat page itself: the conversation may look garbled or stay at an old position after the export, so reload the Chat tab once the export has finished. Your data and the export are not affected.
 
 | Option | What it does | Turn it off if… |
 |---|---|---|
-| **Free Memory While Scanning** | Temporarily removes already-collected messages from the page during the scan and puts them back afterwards, keeping long scans fast. | You want the page left untouched while scanning. |
-| **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
+| ⚠️ **Free Memory While Scanning** | Temporarily removes already-collected messages from the page during the scan and puts them back afterwards, keeping long scans fast. Chat can redraw parts of the list in the meantime, so the conversation may look garbled or incomplete until you reload the tab. | You want the page left untouched while scanning. |
+| ⚠️ **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. The tab navigates on its own and ends at an old message; reload the chat afterwards. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
 | **Nudge History Loading** | Sends a scroll-up event as soon as the top is reached so Chat loads older messages sooner. | History loading misbehaves in your workspace. |
 | **Reuse Scan After a Failure** | A failed export keeps its messages and downloaded media; exporting again skips the rescan (the file notes when the scan was made). | You always want a fresh scan. |
 | **Save Scan Backup** | Downloads a JSON copy of scans with 1000+ messages before media download and packaging. | You don't want the extra file. |

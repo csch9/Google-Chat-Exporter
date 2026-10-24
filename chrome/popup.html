@@ -303,6 +303,7 @@
     .advanced > summary::after { content: '▸'; margin-left: auto; color: var(--text-3); transition: transform .15s; }
     .advanced[open] > summary::after { transform: rotate(90deg); }
     .advanced[open] > summary { border-bottom: 1px solid var(--border); }
+    .option-warn { font-size: 11px; color: #b06000; margin-top: 3px; font-weight: 500; }
 
     /* ── Footer ── */
     .footer {
@@ -446,6 +447,7 @@
         <div class="option-label">
           Free Memory While Scanning
           <div class="option-sub">Temporarily removes collected messages from the page to keep long scans fast. Restored when done.</div>
+          <div class="option-warn">⚠️ The chat may look garbled during and after the export; reload the tab when it finishes.</div>
         </div>
         <label class="toggle">
           <input type="checkbox" id="opt-prune-dom" checked>
@@ -458,6 +460,7 @@
         <div class="option-label">
           Segmented Scanning
           <div class="option-sub">Every 4000 messages, reopens Chat at the oldest message to stay fast. Needs message links to work in your workspace.</div>
+          <div class="option-warn">⚠️ The tab navigates on its own and ends at an old message; reload the chat when the export finishes.</div>
         </div>
         <label class="toggle">
           <input type="checkbox" id="opt-segmented-scan" checked>
