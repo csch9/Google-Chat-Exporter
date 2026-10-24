@@ -117,9 +117,17 @@ All options are on by default except diagnostic logging. Options marked ⚠️ c
 | **Save Scan Backup** | Downloads a JSON copy of scans with 1000+ messages before media download and packaging. | You don't want the extra file. |
 | **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | — |
 
-### Exporting a backup or a kept scan from the console
+### Disaster recovery from the console
 
-Open DevTools on the Chat tab, switch the Console context to **Google Chat Exporter**, and run `gceExportFromMemory()`. It exports, in order of preference, a kept scan from a failed export, stored segments of an interrupted segmented scan, or the messages currently on the page, as HTML with media and without scrolling. Pass a parsed backup to export it instead: `gceExportFromMemory(JSON.parse(text))`.
+Open DevTools on the Chat tab and switch the Console context (the `top` dropdown) to **Google Chat Exporter**. Then:
+
+| Command | What it does |
+|---|---|
+| `gceSaveBackup()` | Downloads a backup JSON of the messages available right now: a kept scan from a failed export, else the stored segments of an interrupted segmented scan, else the messages currently on the page. Works even with **Save Scan Backup** turned off. |
+| `gceExportFromMemory()` | Exports those same messages as HTML with media, without scrolling. |
+| `gceExportBackupFile()` | Opens a file picker; choose a backup JSON (`…_scan-backup_….json`) to export it as HTML with media, without scrolling. Pass `{ format: 'txt' }` for a text export. |
+
+If a packaging step fails after the media download, run `gceExportFromMemory()` again: it reuses the downloaded media and continues with the ZIP part that failed.
 
 ## ⚡ Performance benchmark
 

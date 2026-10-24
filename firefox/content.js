@@ -136,7 +136,7 @@ function showProgress(text, percent, state = 'working') {
       }
       .gce-header {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 10px;
         padding: 14px 16px 10px;
       }
@@ -157,11 +157,18 @@ function showProgress(text, percent, state = 'working') {
         font-size: 13px;
         color: #3c4043;
         flex: 1;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        overflow-wrap: anywhere;
+        line-height: 1.4;
+        max-height: 7em;
+        overflow-y: auto;
         font-weight: 500;
       }
+      .gce-hint {
+        font-size: 11px;
+        color: #80868b;
+        padding: 0 16px 10px 48px;
+      }
+      .gce-hint:empty { display: none; }
       .gce-close {
         background: none;
         border: none;
@@ -214,15 +221,16 @@ function showProgress(text, percent, state = 'working') {
           <span class="gce-label">Initializing...</span>
           <button class="gce-close" title="Dismiss">&times;</button>
         </div>
+        <div class="gce-hint"></div>
         <div class="gce-bar-wrap"><div class="gce-bar"></div></div>
       </div>`;
 
     document.documentElement.appendChild(progressEl);
     progressEl.querySelector('.gce-close').addEventListener('click', () => {
       if (exportInProgress && historyScanStop) {
-        showProgress('Stopping scan — exporting collected messages (click again to cancel)...', 15);
         historyScanStop.abort();
         historyScanStop = null;
+        showProgress('Stopping scan — exporting the messages collected so far...', 15);
       } else if (exportInProgress && exportController) {
         showProgress('Cancelling export...', 0);
         exportController.abort();
@@ -237,6 +245,13 @@ function showProgress(text, percent, state = 'working') {
   const spinner = progressEl.querySelector('.gce-spinner');
 
   if (label) label.textContent = text;
+  // Tells the user what × does right now: stop-and-export while scanning, abort afterwards.
+  const hint = exportInProgress && historyScanStop ? '× stops loading and exports the messages collected so far'
+    : exportInProgress && exportController ? '× aborts the export without saving' : '';
+  const hintEl = progressEl.querySelector('.gce-hint');
+  if (hintEl) hintEl.textContent = hint;
+  const close = progressEl.querySelector('.gce-close');
+  if (close) close.title = hint || 'Dismiss';
   if (bar) {
     bar.style.width = percent + '%';
     bar.className = 'gce-bar' + (state === 'done' ? ' done' : state === 'error' ? ' error' : '');
@@ -1675,23 +1690,54 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
   }
 }
 
-// Console entry point (select the extension's content-script context in DevTools):
+// Console entry points (select the extension's content-script context in DevTools):
 //   gceExportFromMemory()          -> retained scan, else stored scan segments, else every message on the page
 //   gceExportFromMemory(messages)  -> an explicit array, e.g. parsed from a backup JSON
-// Runs the normal HTML + media export as a complete one, without scrolling.
-async function gceExportFromMemory(messages = null, { format = 'html', includeMedia = true } = {}) {
+//   gceExportBackupFile()          -> pick a backup JSON file and export it
+//   gceSaveBackup()                -> download the messages gceExportFromMemory() would use as a backup JSON
+// Exports run the normal HTML + media export as a complete one, without scrolling.
+async function resolveMemoryMessages(messages = null) {
   await loadSelectors();
-  let source = 'argument';
-  if (!messages && retainedScan?.history?.messages?.length) { messages = retainedScan.history.messages; source = 'retained scan'; }
-  if (!messages) {
-    const job = await readSegmentJob();
-    if (job?.segments) { messages = mergeMessages(...await loadSegments(job)); source = `${job.segments} stored segments`; }
-  }
-  if (!messages) { messages = extractMessages(); source = 'page'; }
-  console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${source} as ${format}${includeMedia ? ' + media' : ''}`);
+  if (messages) return { messages, source: 'argument' };
+  if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan' };
+  const job = await readSegmentJob();
+  if (job?.segments) return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments` };
+  return { messages: extractMessages(), source: 'page' };
+}
+
+async function gceExportFromMemory(messages = null, { format = 'html', includeMedia = true } = {}) {
+  const resolved = await resolveMemoryMessages(messages);
+  messages = resolved.messages;
+  console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${resolved.source} as ${format}${includeMedia ? ' + media' : ''}`);
   const media = retainedScan?.history?.messages === messages ? retainedScan.media : undefined;
   retainedScan = { url: location.href, dateFromTs: 0, history: { messages, reason: 'idle', warning: '' }, at: Date.now(), manual: true, media };
   return runExport({ format, includeMedia, loadAll: true });
+}
+
+async function gceSaveBackup(messages = null) {
+  const resolved = await resolveMemoryMessages(messages);
+  saveScanBackup(resolved.messages, getConversationName());
+  return `${resolved.messages.length} messages from ${resolved.source}`;
+}
+
+// The DevTools console counts as a user gesture, so the file picker may open from there.
+function gceExportBackupFile(options = {}) {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.onchange = async () => {
+      try {
+        const messages = JSON.parse(await input.files[0].text());
+        if (!Array.isArray(messages)) throw new Error('The backup file does not contain a message list.');
+        resolve(await gceExportFromMemory(messages, options));
+      } catch (err) {
+        console.error('[Google Chat Exporter] could not export the backup file:', err);
+        reject(err);
+      }
+    };
+    input.click();
+  });
 }
 
 // ── Export Mode (auto-export on channel switch) ─────────────

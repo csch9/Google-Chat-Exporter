@@ -685,6 +685,27 @@ test('oldest-message link follows the app URL, falling back to the copied-link f
     link: 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
 });
 
+test('console backup saves the kept scan and a picked backup file is exported', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.getConversationName = () => 'Fixture';
+  const saved = [];
+  c.saveScanBackup = (messages, name) => saved.push({ count: messages.length, name });
+  vm.runInContext("retainedScan = { url: '', dateFromTs: 0, at: 0, history: { messages: [{ text: 'a' }, { text: 'b' }] } }", c);
+  assert.equal(await c.gceSaveBackup(), '2 messages from retained scan');
+  assert.deepEqual(saved, [{ count: 2, name: 'Fixture' }]);
+
+  let input;
+  c.document.createElement = () => (input = { click() {}, files: [{ text: async () => JSON.stringify([{ text: 'x' }]) }] });
+  const exported = [];
+  c.gceExportFromMemory = async (messages, options) => { exported.push({ messages, options }); return 'done'; };
+  const pending = c.gceExportBackupFile({ format: 'txt' });
+  await input.onchange();
+  assert.equal(await pending, 'done');
+  assert.deepEqual(Array.from(exported[0].messages, m => m.text), ['x']);
+  assert.equal(exported[0].options.format, 'txt');
+});
+
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
   const c = loadContent();
   await c.loadSelectors();

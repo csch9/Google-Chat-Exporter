@@ -1690,23 +1690,54 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
   }
 }
 
-// Console entry point (select the extension's content-script context in DevTools):
+// Console entry points (select the extension's content-script context in DevTools):
 //   gceExportFromMemory()          -> retained scan, else stored scan segments, else every message on the page
 //   gceExportFromMemory(messages)  -> an explicit array, e.g. parsed from a backup JSON
-// Runs the normal HTML + media export as a complete one, without scrolling.
-async function gceExportFromMemory(messages = null, { format = 'html', includeMedia = true } = {}) {
+//   gceExportBackupFile()          -> pick a backup JSON file and export it
+//   gceSaveBackup()                -> download the messages gceExportFromMemory() would use as a backup JSON
+// Exports run the normal HTML + media export as a complete one, without scrolling.
+async function resolveMemoryMessages(messages = null) {
   await loadSelectors();
-  let source = 'argument';
-  if (!messages && retainedScan?.history?.messages?.length) { messages = retainedScan.history.messages; source = 'retained scan'; }
-  if (!messages) {
-    const job = await readSegmentJob();
-    if (job?.segments) { messages = mergeMessages(...await loadSegments(job)); source = `${job.segments} stored segments`; }
-  }
-  if (!messages) { messages = extractMessages(); source = 'page'; }
-  console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${source} as ${format}${includeMedia ? ' + media' : ''}`);
+  if (messages) return { messages, source: 'argument' };
+  if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan' };
+  const job = await readSegmentJob();
+  if (job?.segments) return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments` };
+  return { messages: extractMessages(), source: 'page' };
+}
+
+async function gceExportFromMemory(messages = null, { format = 'html', includeMedia = true } = {}) {
+  const resolved = await resolveMemoryMessages(messages);
+  messages = resolved.messages;
+  console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${resolved.source} as ${format}${includeMedia ? ' + media' : ''}`);
   const media = retainedScan?.history?.messages === messages ? retainedScan.media : undefined;
   retainedScan = { url: location.href, dateFromTs: 0, history: { messages, reason: 'idle', warning: '' }, at: Date.now(), manual: true, media };
   return runExport({ format, includeMedia, loadAll: true });
+}
+
+async function gceSaveBackup(messages = null) {
+  const resolved = await resolveMemoryMessages(messages);
+  saveScanBackup(resolved.messages, getConversationName());
+  return `${resolved.messages.length} messages from ${resolved.source}`;
+}
+
+// The DevTools console counts as a user gesture, so the file picker may open from there.
+function gceExportBackupFile(options = {}) {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.onchange = async () => {
+      try {
+        const messages = JSON.parse(await input.files[0].text());
+        if (!Array.isArray(messages)) throw new Error('The backup file does not contain a message list.');
+        resolve(await gceExportFromMemory(messages, options));
+      } catch (err) {
+        console.error('[Google Chat Exporter] could not export the backup file:', err);
+        reject(err);
+      }
+    };
+    input.click();
+  });
 }
 
 // ── Export Mode (auto-export on channel switch) ─────────────
