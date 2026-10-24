@@ -100,6 +100,10 @@ Install directly from your browser's official store:
 
 Each incremental run creates a new file. Keep earlier files to retain the complete archive. Checkpoints are local to the browser profile and advance only after Chrome reports a completed download.
 
+### Stopping and cancelling
+
+Clicking **×** on the progress box while history is loading stops the scan and exports the messages collected so far; the file notes that older messages are missing. Clicking **×** again, or during media download, aborts the export without saving anything.
+
 ### Advanced scan options
 
 All options are on by default except diagnostic logging.
@@ -109,7 +113,6 @@ All options are on by default except diagnostic logging.
 | **Free Memory While Scanning** | Temporarily removes already-collected messages from the page during the scan and puts them back afterwards, keeping long scans fast. | You want the page left untouched while scanning. |
 | **Segmented Scanning** | Every 4000 messages, stores what was collected and reopens Chat at the oldest message, because Chat slows down with every message it has loaded. If Chat does not open the link, the export finishes with what was collected. | Your workspace does not allow opening message links. |
 | **Nudge History Loading** | Sends a scroll-up event as soon as the top is reached so Chat loads older messages sooner. | History loading misbehaves in your workspace. |
-| **Stop Keeps Collected Messages** | The first × during the scan exports what was collected; a second × cancels. | You want × to always cancel. |
 | **Reuse Scan After a Failure** | A failed export keeps its messages and downloaded media; exporting again skips the rescan (the file notes when the scan was made). | You always want a fresh scan. |
 | **Save Scan Backup** | Downloads a JSON copy of scans with 1000+ messages before media download and packaging. | You don't want the extra file. |
 | **Diagnostic Logging** | Logs scan timing, history-load latency and memory use to the page console. | — |

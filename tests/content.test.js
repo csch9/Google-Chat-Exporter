@@ -705,7 +705,7 @@ test('console export packages on-page messages with media as a complete export, 
   assert.equal(packaged.history.warning, '');
 });
 
-test('advanced scan options turn off segmentation, retry reuse, backups and stop-keeps-messages', async () => {
+test('advanced scan options turn off segmentation, retry reuse and backups; stopping always keeps messages', async () => {
   const c = loadContent();
   await c.loadSelectors();
   c.chrome.storage.local.get = async () => ({ gceSettings: { segmentedScan: false, retryReuse: false, scanBackup: false, stopKeepsMessages: false } });
@@ -728,7 +728,7 @@ test('advanced scan options turn off segmentation, retry reuse, backups and stop
   fail = false;
   assert.equal(await c.runExport({ format: 'txt' }), 'done');
   assert.deepEqual(limits, [0, 0], 'no segmentation, and the retry rescans');
-  assert.equal(stopDuringScan, null, 'the first click cancels instead of keeping messages');
+  assert.ok(stopDuringScan, 'the first click always stops the scan and keeps messages, even with an outdated setting stored');
   assert.equal(backups, 0);
 });
 

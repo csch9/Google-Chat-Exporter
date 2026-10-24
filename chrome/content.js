@@ -90,7 +90,6 @@ const SCAN_OPTION_DEFAULTS = {
   pruneDom: true,          // detach collected history from the page while scanning
   segmentedScan: true,     // reopen Chat at the oldest collected message every SEGMENT_MESSAGES
   historyNudge: true,      // send a wheel event as soon as the scan reaches the top
-  stopKeepsMessages: true, // first × click exports what was collected instead of cancelling
   retryReuse: true,        // a failed export keeps its scan and media for the next attempt
   scanBackup: true,        // download a JSON backup after long scans
   diagnostics: false       // log scan timing, load latency and memory
@@ -1487,7 +1486,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       const scanStop = new AbortController();
       const forwardCancel = () => scanStop.abort();
       signal.addEventListener('abort', forwardCancel, { once: true });
-      historyScanStop = scanOptions.stopKeepsMessages ? scanStop : null;
+      historyScanStop = scanStop;
       const segmentLabel = segmentJob ? `Segment ${segmentJob.segments + 1}: ` : '';
       try {
         history = await scrollToLoadAll(

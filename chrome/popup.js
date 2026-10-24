@@ -11,7 +11,6 @@ const SCAN_OPTION_INPUTS = {
   pruneDom: 'opt-prune-dom',
   segmentedScan: 'opt-segmented-scan',
   historyNudge: 'opt-history-nudge',
-  stopKeepsMessages: 'opt-stop-keeps-messages',
   retryReuse: 'opt-retry-reuse',
   scanBackup: 'opt-scan-backup',
   diagnostics: 'opt-diagnostics'
