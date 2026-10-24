@@ -758,7 +758,7 @@ test('a reopened segment that stalls is reopened elsewhere, then exported with a
   c.location = { href: 'https://chat.google.com/app/chat/DM/topic/m1/message/m1' };
   c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/DM/topic/m0/message/m0', conversation: 'DM', message: 'm0' });
   const stalled = { messages: [{ _dedupKey: 'x', text: 'x', absoluteTimestamp: Date.UTC(2024, 0, 2) }], startCount: 1, reason: 'idle', warning: '' };
-  c.scrollToLoadAll = async () => stalled;
+  c.scrollToLoadAll = async () => ({ ...stalled });
   const navigations = [];
   let packaged = null;
   const pack = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
@@ -770,10 +770,39 @@ test('a reopened segment that stalls is reopened elsewhere, then exported with a
   assert.equal(navigations.length, 1);
   assert.equal(store.gceSegmentJob.retries, 1);
 
-  assert.equal(await c.runExport({ format: 'txt', segmentJob: { ...store.gceSegmentJob, retries: 2 } }), 'done');
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: { ...store.gceSegmentJob, retries: 10 } }), 'done');
   assert.equal(navigations.length, 1, 'no further reopen once retries run out');
-  assert.match(packaged.history.warning, /stopped loading older messages/);
+  assert.match(packaged.history.warning, /may be incomplete.*after 10 reopen attempts/);
+  assert.equal(packaged.history.reason, 'stalled');
   assert.deepEqual(Array.from(packaged.messages, m => m.text), ['x', 'y']);
+
+  // The visible "created this chat" line means the real start was reached: no reopen, no warning.
+  c.conversationStartVisible = () => true;
+  store.gceSegmentJob = job;
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'done');
+  assert.equal(navigations.length, 1);
+  assert.equal(packaged.history.reason, 'idle');
+  assert.equal(packaged.history.warning, '');
+});
+
+test('a reopened page that barely loads anything gives up after fewer idle checks', async () => {
+  const run = async quickStall => {
+    const c = loadContent();
+    await c.loadSelectors();
+    const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 0,
+      getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+    c.findScrollContainer = () => container;
+    c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
+    c.getOldestTimestamp = () => 1;
+    c.sleep = async () => {};
+    c.provokeHistoryLoad = async () => false;
+    let waits = 0;
+    c.waitForHistoryMutation = async () => { waits++; };
+    const result = await c.scrollToLoadAll(null, 0, null, 0, quickStall);
+    assert.equal(result.reason, 'idle');
+    return waits;
+  };
+  assert.ok(await run(true) < await run(false));
 });
 
 test('console export packages on-page messages with media as a complete export, without scrolling', async () => {

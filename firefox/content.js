@@ -367,7 +367,7 @@ function findScrollContainer() {
   return best;
 }
 
-async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmentLimit = 0) {
+async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmentLimit = 0, quickStall = false) {
   const container = findScrollContainer();
   if (!container) {
     onProgress && onProgress('No scroll container found — exporting visible messages only');
@@ -492,7 +492,9 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
           prevOldest = oldest;
         } else if (container.scrollTop <= 1 && previousTop <= 1) {
           stableBatches++;
-          if (stableBatches >= STABLE_BATCH_LIMIT) { reason = 'idle'; break; }
+          // A reopened page that barely loaded anything is usually stuck; give up early so it can be reopened elsewhere.
+          const limit = quickStall && dedupMap.size - startCount < SEGMENT_STALL_MESSAGES ? QUICK_STALL_BATCH_LIMIT : STABLE_BATCH_LIMIT;
+          if (stableBatches >= limit) { reason = 'idle'; break; }
         }
         // Pruning shrinks scrollHeight; rebase so it is not mistaken for newly loaded history.
         mark = Date.now();
@@ -1351,8 +1353,19 @@ const SEGMENT_JOB_KEY = 'gceSegmentJob';
 const SEGMENT_HOP_MAX_AGE_MS = 10 * 60 * 1000;
 // A reopened segment that gains fewer messages than this before going idle is treated as stalled, not as the start.
 let SEGMENT_STALL_MESSAGES = 50;
-const SEGMENT_STALL_RETRIES = 2;
+const SEGMENT_STALL_RETRIES = 10;
+const QUICK_STALL_BATCH_LIMIT = 3;
 const segmentKey = (jobId, n) => `gceSegment:${jobId}:${n}`;
+
+// Chat shows "<person> created this chat/space" above the first message; English UI only.
+function conversationStartVisible() {
+  if (typeof document.createTreeWalker !== 'function') return false;
+  const walker = document.createTreeWalker(findScrollContainer() || document.body, 4 /* NodeFilter.SHOW_TEXT */);
+  for (let i = 0; i < 400 && walker.nextNode(); i++) {
+    if (/\bcreated this (chat|space|group|conversation)\b/i.test(walker.currentNode.nodeValue)) return true;
+  }
+  return false;
+}
 
 // Returns { link, conversation } for the topmost (oldest) rendered message, or null.
 function oldestMessageLink() {
@@ -1532,7 +1545,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         : count == null ? `Segment ${segmentNumber}: ${text}`
         : `Segment ${segmentNumber}: loading history... ${count.toLocaleString()} messages in this segment, ${before ? '~' : ''}${(before + count).toLocaleString()} total`, 15);
       try {
-        history = await scrollToLoadAll(progress, dateFromTs, scanStop.signal, segmentLimit);
+        history = await scrollToLoadAll(progress, dateFromTs, scanStop.signal, segmentLimit, !!segmentJob);
       } finally {
         historyScanStop = null;
         signal.removeEventListener('abort', forwardCancel);
@@ -1550,7 +1563,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         history.warning = 'Could not reopen Chat at an older message to continue the scan; older messages may be missing.';
       }
       // A reopened page sometimes never loads older history; reopen elsewhere rather than mistake it for the start.
-      if (segmentJob && history.reason === 'idle' && history.messages.length - (history.startCount || 0) < SEGMENT_STALL_MESSAGES) {
+      if (segmentJob && history.reason === 'idle' && history.messages.length - (history.startCount || 0) < SEGMENT_STALL_MESSAGES &&
+          !conversationStartVisible()) {
         const retries = segmentJob.retries || 0;
         const target = oldestMessageLink();
         if (target && retries < SEGMENT_STALL_RETRIES) {
@@ -1560,7 +1574,9 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
           return 'segment';
         }
         const oldest = history.messages.find(m => m.absoluteTimestamp)?.absoluteTimestamp;
-        history.warning = `Chat stopped loading older messages after reopening${oldest ? ` at ${new Date(oldest).toLocaleDateString()}` : ''}. If the conversation is older than that, turn off Segmented Scanning and export again for the full history.`;
+        history.reason = 'stalled';
+        history.warning = `⚠️ Export may be incomplete: Chat stopped loading older messages after ${retries} reopen attempts${oldest ? `, at ${new Date(oldest).toLocaleDateString()}` : ''}. If the conversation is older than that, turn off Segmented Scanning and export again.`;
+        console.warn(`[Google Chat Exporter] ${history.warning}`);
       }
       if (segmentJob) {
         history.messages = mergeMessages(...await loadSegments(segmentJob), history.messages);
@@ -1658,7 +1674,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (initialUrl && !isSameConversationUrl(initialUrl, location.href)) {
       throw new Error('Conversation changed during export. Please retry.');
     }
-    const candidate = checkpointKey && loadAll && !mediaFailed && !['limit', 'visible-only', 'stopped'].includes(history.reason)
+    const candidate = checkpointKey && loadAll && !mediaFailed && !['limit', 'visible-only', 'stopped', 'stalled'].includes(history.reason)
       ? await buildCheckpoint(messages) : null;
     if (mediaFailed) history.warning = `${history.warning || ''} Some attachments failed; the checkpoint will not advance.`.trim();
     if (incremental && !candidate && !mediaFailed) history.warning = `${history.warning || ''} No safe checkpoint was saved; the next export may repeat messages.`.trim();
