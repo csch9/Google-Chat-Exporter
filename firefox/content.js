@@ -365,6 +365,15 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     const NO_PROGRESS_LIMIT_MS = 90000;
     let lastProgressAt = Date.now();
     let walkingBack = false;
+    const timing = { wait: 0, collect: 0, prune: 0, pruned: 0, since: Date.now(), loads: 0, loadMs: 0, loadMax: 0, triggers: {} };
+    // Time from reaching the top until Chat delivers older history, labelled by the last nudge sent.
+    let topSince = 0;
+    let topTrigger = '';
+    const milestone = { next: Math.floor(dedupMap.size / 1000) * 1000 + 1000, at: Date.now(), batches: 0 };
+    console.log('[Google Chat Exporter] history scan started', {
+      messages: dedupMap.size, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight,
+      domNodes: document.getElementsByTagName?.('*').length
+    });
 
     onProgress && onProgress('Scrolling up to load full history...');
 
@@ -389,17 +398,45 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
         const targetTop = Math.max(0, previousTop - Math.max(1, container.clientHeight * 0.75));
         if (targetTop <= 1 && previousTop <= 1 && stableBatches > 0) {
           if (walkingBack) walkingBack = false;
-          else if (await provokeHistoryLoad(container, stableBatches, signal)) { walkingBack = true; continue; }
+          else {
+            topTrigger = `retry${stableBatches}`;
+            if (await provokeHistoryLoad(container, stableBatches, signal)) { walkingBack = true; continue; }
+          }
         }
         const wait = waitForHistoryMutation(container, prevHeight, prevOldest,
           targetTop > 1 ? 250 : Math.min(600 * (stableBatches + 1), 4000), signal, targetTop > 1);
         container.scrollTop = targetTop;
+        if (targetTop <= 1 && !topSince) {
+          topSince = Date.now();
+          topTrigger = 'arrival';
+          // Chat may only fetch on user-like input; nudging now avoids sitting through the passive back-off first.
+          if (typeof WheelEvent === 'function') container.dispatchEvent?.(new WheelEvent('wheel', { deltaY: -300, bubbles: true, cancelable: true }));
+        }
+        let mark = Date.now();
         await wait;
+        timing.wait += Date.now() - mark;
+        mark = Date.now();
         collectCurrent();
+        timing.collect += Date.now() - mark;
 
         const oldest = getOldestTimestamp();
         const curHeight = container.scrollHeight;
         const advanced = dedupMap.size > beforeCount || curHeight !== prevHeight || (oldest && oldest !== prevOldest);
+        if (topSince && oldest && prevOldest && oldest < prevOldest) {
+          const ms = Date.now() - topSince;
+          timing.loads++;
+          timing.loadMs += ms;
+          timing.loadMax = Math.max(timing.loadMax, ms);
+          timing.triggers[topTrigger] = (timing.triggers[topTrigger] || 0) + 1;
+          topSince = 0;
+        }
+        milestone.batches++;
+        while (dedupMap.size >= milestone.next) {
+          console.log(`[Google Chat Exporter] reached ${milestone.next} messages`, {
+            secondsForLast1000: Math.round((Date.now() - milestone.at) / 1000), steps: milestone.batches, heapMB: heapMB()
+          });
+          Object.assign(milestone, { next: milestone.next + 1000, at: Date.now(), batches: 0 });
+        }
         if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest))) lastProgressAt = Date.now();
         else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = 'idle'; break; }
 
@@ -413,7 +450,28 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
           if (stableBatches >= STABLE_BATCH_LIMIT) { reason = 'idle'; break; }
         }
         // Pruning shrinks scrollHeight; rebase so it is not mistaken for newly loaded history.
-        if (pruner.prune()) prevHeight = container.scrollHeight;
+        mark = Date.now();
+        const pruned = pruner.prune();
+        if (pruned) prevHeight = container.scrollHeight;
+        timing.prune += Date.now() - mark;
+        timing.pruned += pruned;
+
+        if (batches % 10 === 0) {
+          console.log('[Google Chat Exporter] scan timing (last 10 batches, ms)', {
+            batches, messages: dedupMap.size, total: Date.now() - timing.since,
+            wait: timing.wait, collect: timing.collect, prune: timing.prune, prunedNow: timing.pruned,
+            scrollHeight: container.scrollHeight,
+            groups: container.querySelectorAll(SEL.messageGroups).length,
+            prunedTotal: pruner.count,
+            domNodes: document.getElementsByTagName?.('*').length,
+            historyLoads: timing.loads,
+            avgLoadMs: timing.loads ? Math.round(timing.loadMs / timing.loads) : null,
+            maxLoadMs: timing.loadMax,
+            loadTriggers: timing.triggers,
+            heapMB: heapMB()
+          });
+          Object.assign(timing, { wait: 0, collect: 0, prune: 0, pruned: 0, since: Date.now(), loads: 0, loadMs: 0, loadMax: 0, triggers: {} });
+        }
 
         if (batches % 2 === 0) {
           onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`);
@@ -426,7 +484,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     }
 
     collectCurrent(true);
-    console.info('[Google Chat Exporter] history scan finished', {
+    console.log('[Google Chat Exporter] history scan finished', {
       reason, batches, messages: dedupMap.size, stableBatches,
       scrollTop: container.scrollTop, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight,
       groups: document.querySelectorAll(SEL.messageGroups).length
@@ -444,6 +502,12 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
     pruner.restore();
     restoreScrollPosition(container, distanceFromBottom, anchor);
   }
+}
+
+// Chromium-only; undefined elsewhere.
+function heapMB() {
+  return typeof performance !== 'undefined' && performance.memory
+    ? Math.round(performance.memory.usedJSHeapSize / 1048576) : undefined;
 }
 
 // Chat fetches older history on scroll input, so a scrollTop pinned at 0 never triggers it; vary the trigger per retry.
