@@ -1426,7 +1426,11 @@ async function loadSegments(job) {
 
 async function clearSegmentJob(job, key = null) {
   if (!job) return;
-  await chrome.storage.local.remove([key || await segmentJobKey(), ...Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n))]);
+  key = key || await segmentJobKey();
+  // The tab may have started another segmented scan since; leave that job in place.
+  const current = (await chrome.storage.local.get(key))[key];
+  const keys = Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n));
+  await chrome.storage.local.remove(!current || current.id === job.id ? [key, ...keys] : keys);
 }
 
 async function hopToNextSegment(job, messages, target, options, retries = 0) {
@@ -1465,7 +1469,7 @@ async function resumeSegmentJob() {
   }
   await writeSegmentJob({ ...job, state: 'running' });
   // Some workspaces do not open message links; scanning from wherever Chat landed would loop, so export what is stored.
-  if (job.message && !document.querySelector(`[${SEL.attrs.groupId}="${job.message}"]`)) {
+  if (job.message && !document.querySelector(`[${SEL.attrs.groupId}="${job.message}"], [data-message-id="${job.message}"]`)) {
     console.warn('[Google Chat Exporter] Chat did not open the linked message; exporting the stored segments.');
     const messages = mergeMessages(...await loadSegments(job));
     const dateFrom = job.options?.dateFrom || '';
@@ -1565,6 +1569,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     const dateFromTs = previous?.timestamp || (dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0);
 
     let reusedMedia = null;
+    // A kept scan from a segmented run still owns that run's stored segments until an export succeeds.
+    const ownedJob = segmentJob || retainedScan?.segmentJob || null;
     if (loadAll && retainedScan && (retainedScan.manual || (scanOptions.retryReuse && conversationKey && retainedScan.conversation === conversationKey)) &&
         retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
       history = { ...retainedScan.history };
@@ -1575,6 +1581,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       else history.messages.forEach(m => (m.media || []).forEach(x => { delete x._localPath; }));
       showProgress(`Reusing ${history.messages.length} messages from the previous unfinished export...`, 15);
       messages = history.messages;
+      // The segments are cleared on success, so the backup must hold these messages itself.
+      if (segmentJob) scanned = messages;
     } else if (loadAll) {
       throwIfAborted(signal);
       const scanStop = new AbortController();
@@ -1633,7 +1641,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         segments: segmentJob ? segmentJob.segments + 1 : 1,
         stallRetries: segmentJob?.stallRetries || 0
       };
-      retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now() } : null;
+      retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now(), segmentJob } : null;
       messages = history.messages;
       await sleep(200, signal);
     }
@@ -1769,7 +1777,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     }
       if (resp && resp.success) {
         retainedScan = null;
-        if (segmentJob) await clearSegmentJob(segmentJob).catch(() => {});
+        if (ownedJob) await clearSegmentJob(ownedJob).catch(() => {});
         const parts = resp.parts > 1 ? ` Extract all ${resp.parts} parts into the same folder.` : '';
         const next = auto ? ' Auto-export: open the next channel.' : '';
         showProgress(`Saved as ${resp.filename}.${parts} ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');

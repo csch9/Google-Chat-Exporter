@@ -725,6 +725,64 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
   assert.deepEqual(Object.keys(store), [], 'stored segments are cleared after a successful export');
 });
 
+test('a resumed page finds the linked message by either ID, backs up stored segments, and a retry clears the job', async () => {
+  const store = {};
+  const storage = {
+    async get(keys) {
+      if (keys == null) return { ...store };
+      return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+    },
+    async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+    async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+  };
+  const page = async ({ scan, onPage = () => true, fail = () => false }) => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = storage;
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => 'Fixture';
+    c.showProgress = () => {};
+    const sent = { backups: [], scans: 0, packaged: null };
+    c.saveScanBackup = messages => sent.backups.push(Array.from(messages, m => m.text));
+    vm.runInContext('SCAN_BACKUP_MIN_MESSAGES = 1; SEGMENT_STALL_MESSAGES = 0', c);
+    c.sleep = async () => {};
+    c.location = { href: 'https://chat.google.com/app/chat/SPACE/topic/m1/message/m1' };
+    c.document.querySelector = selector => (/="m1"/.test(selector) ? onPage(selector) : true) ? {} : null;
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/SPACE/topic/m1/message/m1', conversation: 'SPACE', message: 'm1' });
+    c.scrollToLoadAll = async () => { sent.scans++; return scan; };
+    const pack = packageRecorder(payload => { sent.packaged = payload; return fail() ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' }; });
+    c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? { success: true } : pack(msg);
+    return { c, sent };
+  };
+  const msg = (key, ts) => ({ _dedupKey: key, text: key, absoluteTimestamp: ts });
+  const hop = async () => assert.equal(await (await page({ scan: { messages: [msg('b', 2)], reason: 'segment', warning: '' } })).c.runExport({ format: 'txt' }), 'segment');
+
+  // The message is only found through data-message-id: the scan continues.
+  await hop();
+  const byMessageId = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' }, onPage: s => /data-message-id/.test(s) });
+  assert.equal(await byMessageId.c.resumeSegmentJob(), 'done');
+  assert.equal(byMessageId.sent.scans, 1);
+
+  // Chat did not open the link: the stored segments are exported and still backed up.
+  await hop();
+  const notOpened = await page({ scan: null, onPage: () => false });
+  assert.equal(await notOpened.c.resumeSegmentJob(), 'done');
+  assert.deepEqual(notOpened.sent.backups, [['b']]);
+  assert.deepEqual(Object.keys(store), []);
+
+  // Packaging fails on the last page; a plain retry clears the finished job and its segments.
+  await hop();
+  let failing = true;
+  const retry = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' }, fail: () => failing });
+  assert.equal(await retry.c.resumeSegmentJob(), 'error');
+  assert.ok(Object.keys(store).length, 'the segments survive the failure');
+  failing = false;
+  assert.equal(await retry.c.runExport({ format: 'txt' }), 'done');
+  assert.equal(retry.sent.scans, 1, 'the retry reused the kept scan');
+  assert.deepEqual(Object.keys(store), [], 'the retry cleared the job');
+});
+
 test('segmented scans in two tabs keep separate jobs and segments', async () => {
   const store = {};
   const tab = async tabId => {
