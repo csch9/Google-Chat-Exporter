@@ -1485,7 +1485,7 @@ async function resumeSegmentJob() {
     console.warn('[Google Chat Exporter] Chat did not open the linked message; exporting the stored segments.');
     const messages = mergeMessages(...await loadSegments(job));
     const dateFrom = job.options?.dateFrom || '';
-    retainedScan = { url: location.href, dateFromTs: dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0, at: Date.now(), manual: true, segmentJob: job,
+    retainedScan = { url: location.href, dateFromTs: dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0, at: Date.now(), manual: true, segmentJob: job, name: job.name,
       history: { messages, reason: 'limit', warning: 'Chat could not reopen at an older message, so the segmented scan ended early; older messages may be missing. Turn off segmented scanning and export again for the full history.' } };
     return runExport({ ...job.options, sourceUrl: '', segmentJob: job });
   }
@@ -1596,10 +1596,13 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
 
     let reusedMedia = null;
     let ownedJob = segmentJob;
+    // Recovered scans keep the name of the conversation they came from, which may not be the open one.
+    let recoveredName = '';
     if (loadAll && retainedScan && (retainedScan.manual || (scanOptions.retryReuse && conversationKey && retainedScan.conversation === conversationKey)) &&
         retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
       // A kept scan from a segmented run still owns that run's stored segments until an export succeeds.
       ownedJob = segmentJob || retainedScan.segmentJob || null;
+      if (retainedScan.manual) recoveredName = retainedScan.name || '';
       history = { ...retainedScan.history };
       // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
       history.warning = retainedScan.manual ? (history.warning || '')
@@ -1669,7 +1672,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         segments: segmentJob ? segmentJob.segments + 1 : 1,
         stallRetries: segmentJob?.stallRetries || 0
       };
-      retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now(), segmentJob } : null;
+      retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now(), segmentJob, name: getConversationName() } : null;
       messages = history.messages;
       await sleep(200, signal);
     }
@@ -1678,7 +1681,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     await sleep(100, signal);
 
     if (!messages) messages = extractMessages();
-    const conversationName = getConversationName() || 'Google Chat';
+    const conversationName = recoveredName || getConversationName() || 'Google Chat';
     if (incremental && !checkpointKey) {
       scope = await contentCheckpointScope(messages, conversationName, format, includeMedia, sourceUrl || initialUrl);
       if (!scope) throw new Error('Cannot create a safe conversation identity because the loaded messages have no timestamps.');
@@ -1888,7 +1891,7 @@ function buildExportStats({ conversationName, messages, exportDate, format, incl
 async function saveRunBackup(scanned, segmentJob) {
   try {
     const messages = segmentJob?.segments ? mergeMessages(...await loadSegments(segmentJob), scanned || []) : scanned;
-    if (messages?.length >= SCAN_BACKUP_MIN_MESSAGES) await saveScanBackup(messages, getConversationName());
+    if (messages?.length >= SCAN_BACKUP_MIN_MESSAGES) await saveScanBackup(messages, segmentJob?.name || getConversationName());
   } catch (err) {
     console.error('[Google Chat Exporter] could not save scan backup:', err);
   }
@@ -1903,11 +1906,11 @@ async function saveRunBackup(scanned, segmentJob) {
 async function resolveMemoryMessages(messages = null) {
   await loadSelectors();
   if (messages) return { messages, source: 'argument' };
-  if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan' };
+  if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan', name: retainedScan.name };
   // A closed or crashed tab leaves its segments behind; recover the most recent job from any tab.
   const own = await readSegmentJob().catch(() => null);
   const job = own || (await storedSegmentJobs()).map(([, j]) => j).sort((a, b) => (b?.at || 0) - (a?.at || 0))[0];
-  if (job?.segments) return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments` };
+  if (job?.segments) return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments of "${job.name || 'unknown'}"`, name: job.name };
   return { messages: extractMessages(), source: 'page' };
 }
 
@@ -1919,14 +1922,14 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
   const kept = retainedScan?.history?.messages === messages ? retainedScan : null;
   // Recovered messages may be partial or from another conversation, so they never advance a checkpoint.
   const history = kept ? { ...kept.history, messages } : { messages, reason: 'recovery', warning: '' };
-  retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true,
+  retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true, name: resolved.name || '',
     media: kept?.media, partIds: kept?.partIds || [], segmentJob: kept?.segmentJob };
   return runExport({ format, includeMedia, loadAll: true });
 }
 
 async function gceSaveBackup(messages = null) {
   const resolved = await resolveMemoryMessages(messages);
-  await saveScanBackup(resolved.messages, getConversationName());
+  await saveScanBackup(resolved.messages, resolved.name || getConversationName());
   return `${resolved.messages.length} messages from ${resolved.source}`;
 }
 

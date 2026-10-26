@@ -1110,6 +1110,31 @@ test('only Chat\'s own creation notice marks the start of a conversation', async
   assert.equal(check('Claudio created this chat', true), false, 'a message quoting it is not the notice');
 });
 
+test('recovering another conversation\'s stored segments keeps that conversation\'s name', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Open chat';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/OPEN' };
+  const store = { 'gceSegmentJob:9': { id: 'j9', segments: 1, name: 'Closed chat', at: 1 }, 'gceSegment:j9:0': [{ text: 'a', absoluteTimestamp: 1 }] };
+  c.chrome.storage.local = {
+    async get(keys) { return keys == null ? { ...store } : Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]])); },
+    async set() {}, async remove() {}
+  };
+  const saved = [];
+  c.saveScanBackup = (messages, name) => saved.push(name);
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(packaged.conversationName, 'Closed chat');
+  assert.equal(packaged.stats.conversation, 'Closed chat');
+  vm.runInContext('retainedScan = null', c);
+  await c.gceSaveBackup();
+  assert.deepEqual(saved, ['Closed chat']);
+});
+
 test('exports carry stats about the version, message range and scan', async () => {
   const c = loadContent();
   await c.loadSelectors();
