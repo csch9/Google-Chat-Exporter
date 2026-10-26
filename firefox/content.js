@@ -1640,6 +1640,10 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }
       scanned = history.messages;
       throwIfAborted(signal);
+      if ((initialUrl && !isSameConversationUrl(initialUrl, location.href)) ||
+          (conversationKey && currentConversation()?.key !== conversationKey)) {
+        throw new Error('Conversation changed during export. Please retry.');
+      }
       if (history.reason === 'segment') {
         const target = oldestMessageLink();
         if (target) {
@@ -1934,7 +1938,7 @@ async function resolveMemoryMessages(messages = null) {
   const [key, job] = jobs.find(([k]) => k === ownKey) || jobs.sort(([, a], [, b]) => (b?.at || 0) - (a?.at || 0))[0] || [];
   if (job?.segments) {
     // Another tab may still be scanning into this job; only a job no scan can still be using is cleared after export.
-    const idle = key === ownKey || job.state === 'finished' || Date.now() - (job.at || 0) > SEGMENT_HOP_MAX_AGE_MS;
+    const idle = key === ownKey || job.state === 'finished';
     return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments of "${job.name || 'unknown'}"`, name: job.name,
       job: idle ? job : null, jobKey: key };
   }
