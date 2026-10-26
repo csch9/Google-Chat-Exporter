@@ -995,8 +995,26 @@ test('console export packages on-page messages with media as a complete export, 
   assert.equal(await c.gceExportFromMemory(), 'done');
   assert.equal(packaged.messages.length, 1);
   assert.equal(packaged.mediaFiles.length, 1);
-  assert.equal(packaged.history.reason, 'idle');
+  assert.equal(packaged.history.reason, 'recovery');
   assert.equal(packaged.history.warning, '');
+  assert.equal(packaged.checkpoint, null, 'recovered messages never advance the checkpoint');
+});
+
+test('a console export keeps the kept scan\'s incomplete-history warning', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  vm.runInContext("retainedScan = { url: '', dateFromTs: 0, at: 0, history: { messages: [{ text: 'a', absoluteTimestamp: 5 }], reason: 'stalled', warning: 'may be incomplete' } }", c);
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(packaged.history.reason, 'stalled');
+  assert.equal(packaged.history.warning, 'may be incomplete');
+  assert.equal(packaged.checkpoint, null);
 });
 
 test('a cancel during preparation stops the export before the history scan starts', async () => {

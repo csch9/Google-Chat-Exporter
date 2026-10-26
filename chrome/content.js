@@ -1733,7 +1733,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (initialUrl && !isSameConversationUrl(initialUrl, location.href)) {
       throw new Error('Conversation changed during export. Please retry.');
     }
-    const candidate = checkpointKey && loadAll && !mediaFailed && !['limit', 'visible-only', 'stopped', 'stalled'].includes(history.reason)
+    const candidate = checkpointKey && loadAll && !mediaFailed && !history.recovery && !['limit', 'visible-only', 'stopped', 'stalled'].includes(history.reason)
       ? await buildCheckpoint(messages) : null;
     if (mediaFailed) history.warning = `${history.warning || ''} Some attachments failed; the checkpoint will not advance.`.trim();
     if (incremental && !candidate && !mediaFailed) history.warning = `${history.warning || ''} No safe checkpoint was saved; the next export may repeat messages.`.trim();
@@ -1869,8 +1869,10 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
   console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${resolved.source} as ${format}${includeMedia ? ' + media' : ''}`);
   // Re-running after a failed ZIP part continues with that part instead of repeating saved ones.
   const kept = retainedScan?.history?.messages === messages ? retainedScan : null;
-  retainedScan = { url: location.href, dateFromTs: 0, history: { messages, reason: 'idle', warning: '' }, at: Date.now(), manual: true,
-    media: kept?.media, partsDone: kept?.partsDone || 0, partDownloads: kept?.partDownloads || [] };
+  // Recovered messages may be partial or from another conversation, so they never advance a checkpoint.
+  const history = kept ? { ...kept.history, messages } : { messages, reason: 'recovery', warning: '' };
+  retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true,
+    media: kept?.media, partsDone: kept?.partsDone || 0, partDownloads: kept?.partDownloads || [], segmentJob: kept?.segmentJob };
   return runExport({ format, includeMedia, loadAll: true });
 }
 
