@@ -1522,6 +1522,20 @@ async function sendPackage(format, payload) {
   }
 }
 
+// Resolves to 'complete', 'failed', or 'pending' when the browser is still saving after the wait.
+let DOWNLOAD_WAIT_MS = 60000;
+async function waitForDownloads(ids) {
+  if (!ids.length) return 'complete';
+  for (const started = Date.now(); ;) {
+    const states = (await chrome.runtime.sendMessage({ action: 'downloadStates', ids }).catch(() => null))?.states;
+    const values = states ? ids.map(id => states[id]) : [];
+    if (states && values.every(state => state === 'complete')) return 'complete';
+    if (values.some(state => state && state !== 'complete' && state !== 'in_progress')) return 'failed';
+    if (Date.now() - started >= DOWNLOAD_WAIT_MS) return 'pending';
+    await sleep(1000);
+  }
+}
+
 async function runExport({ format = 'txt', loadAll = true, includeMedia = true, dateFrom = '', incremental = false, sourceUrl = '', auto = false, segmentJob = null }) {
   if (exportInProgress) return 'busy';
   exportInProgress = true;
@@ -1751,6 +1765,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     const checkpoint = candidate ? { key: checkpointKey, value: candidate } : null;
     const stats = buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt: segmentJob?.startedAt || runStartedAt });
     let resp;
+    let savedIds = [];
     if (format === 'html') {
       // One request per ZIP part: a single long request gets the service worker killed (~5 min limit) and holds all media at once.
       const chunks = [[]];
@@ -1763,9 +1778,9 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       const resumable = retainedScan?.media?.files === mediaFiles;
       // Download IDs per saved part; a part whose download did not complete is packaged again.
       const done = resumable ? [...(retainedScan.partIds || [])] : [];
-      const savedIds = done.flatMap(ids => ids || []);
-      if (savedIds.length) {
-        const states = (await chrome.runtime.sendMessage({ action: 'downloadStates', ids: savedIds }).catch(() => null))?.states || {};
+      const earlierIds = done.flatMap(ids => ids || []);
+      if (earlierIds.length) {
+        const states = (await chrome.runtime.sendMessage({ action: 'downloadStates', ids: earlierIds }).catch(() => null))?.states || {};
         done.forEach((ids, i) => { if (ids && !ids.every(id => ['complete', 'in_progress'].includes(states[id]))) done[i] = undefined; });
       }
       const pending = chunks.map((_, i) => i).filter(i => !done[i]);
@@ -1784,16 +1799,28 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         if (resumable) retainedScan.partIds = [...done];
       }
       if (resp?.success) resp = { ...resp, filename: filenames.join(', '), parts: chunks.length };
+      savedIds = done.flatMap(ids => ids || []);
     } else {
       resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, stats, history: historyInfo, checkpoint });
+      savedIds = resp?.downloadIds || [];
     }
+      // A started download can still fail (e.g. disk full), so recovery data is only dropped once every file is saved.
+      const saved = resp?.success ? await waitForDownloads(savedIds) : '';
+      if (saved === 'failed') {
+        showProgress('❌ Export failed: the browser could not save every file.' + retryHint(), 0, 'error');
+        return 'error';
+      }
       if (resp && resp.success) {
-        retainedScan = null;
-        if (ownedJob) await clearSegmentJob(ownedJob).catch(() => {});
+        const keep = saved !== 'complete';
+        if (!keep) {
+          retainedScan = null;
+          if (ownedJob) await clearSegmentJob(ownedJob).catch(() => {});
+        }
         const parts = resp.parts > 1 ? ` Extract all ${resp.parts} parts into the same folder.` : '';
         const next = auto ? ' Auto-export: open the next channel.' : '';
-        showProgress(`Saved as ${resp.filename}.${parts} ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');
-        if (!history.warning && !parts) setTimeout(hideProgress, 4000);
+        const pending = keep ? ' Some downloads have not finished; the scan is kept so you can export again if one fails.' : '';
+        showProgress(`Saved as ${resp.filename}.${parts} ${history.warning || ''} ${resp.checkpointWarning || ''}${pending}${next}`, 100, 'done');
+        if (!history.warning && !parts && !keep) setTimeout(hideProgress, 4000);
         return 'done';
       } else {
         console.error('[Google Chat Exporter] Packaging failed:', resp?.error || resp);

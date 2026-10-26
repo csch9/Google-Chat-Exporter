@@ -1048,6 +1048,29 @@ test('walking up through already-loaded history keeps the scan alive; a scroll t
   assert.match(stuck.result.warning, /may be missing/);
 });
 
+test('an export keeps its recovery data until the browser has saved every file', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let scans = 0;
+  c.scrollToLoadAll = async () => { scans++; return { messages: [{ text: 'a' }], reason: 'idle', warning: '' }; };
+  let state = 'interrupted';
+  let nextId = 1;
+  c.chrome.runtime.sendMessage = packageRecorder(() => ({ success: true, filename: 'x.txt', downloadIds: [nextId++] }), 1, () => state);
+  assert.equal(await c.runExport({ format: 'txt' }), 'error', 'an interrupted download fails the export');
+  state = 'complete';
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 1, 'the retry reused the kept scan');
+  vm.runInContext('DOWNLOAD_WAIT_MS = 0', c);
+  state = 'in_progress';
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 2);
+  assert.ok(vm.runInContext('retainedScan', c), 'a download still in progress keeps the scan');
+});
+
 test('an HTML export that downloads media again drops packaged paths left from earlier attempts', async () => {
   const c = loadContent();
   await c.loadSelectors();
