@@ -949,6 +949,28 @@ test('stored segment jobs stay recoverable: a new scan keeps the old job, a fail
   await recover.chrome.storage.local.remove('gceSegmentJob:recovery:a');
   assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
   assert.ok(store['gceSegmentJob:7'] && store['gceSegment:r:0'], 'the other tab\'s running job is kept');
+
+  // That tab stopped refreshing its job long ago (closed or crashed): recovery clears it.
+  store['gceSegmentJob:7'] = { ...store['gceSegmentJob:7'], at: Date.now() - 20 * 60000, alive: Date.now() - 6 * 60000 };
+  vm.runInContext('retainedScan = null', recover);
+  assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(store['gceSegmentJob:7'], undefined, 'the abandoned job is cleared');
+  assert.equal(store['gceSegment:r:0'], undefined);
+
+  // A scanning page keeps its job marked as alive.
+  const live = await setup();
+  live.setInterval = setInterval;
+  live.clearInterval = clearInterval;
+  vm.runInContext('SEGMENT_HEARTBEAT_MS = 1', live);
+  store['gceSegmentJob:1'] = { id: 'l', segments: 1, state: 'running', at: 0 };
+  let aliveDuringScan = 0;
+  live.scrollToLoadAll = async () => {
+    await new Promise(resolve => setTimeout(resolve, 30));
+    aliveDuringScan = store['gceSegmentJob:1']?.alive || 0;
+    return { messages: [msg('l')], reason: 'idle', warning: '' };
+  };
+  assert.equal(await live.runExport({ format: 'txt', segmentJob: { ...store['gceSegmentJob:1'] } }), 'done');
+  assert.ok(aliveDuringScan > 0, 'the job was refreshed while scanning');
 });
 
 test('oldest-message link follows the app URL, falling back to the copied-link format', async () => {

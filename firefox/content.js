@@ -1356,6 +1356,9 @@ const SEGMENT_JOB_KEY = 'gceSegmentJob';
 const SEGMENT_HOP_MAX_AGE_MS = 10 * 60 * 1000;
 // Jobs of closed or abandoned tabs are removed when a new segmented scan starts.
 const SEGMENT_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// A scanning page refreshes its job this often, so recovery can tell a crashed or closed tab from a live scan.
+let SEGMENT_HEARTBEAT_MS = 30000;
+const SEGMENT_JOB_ALIVE_MS = 5 * 60 * 1000;
 // A reopened segment that gains fewer messages than this before going idle is treated as stalled, not as the start.
 let SEGMENT_STALL_MESSAGES = 50;
 const SEGMENT_STALL_RETRIES = 10;
@@ -1420,6 +1423,12 @@ async function readSegmentJob() {
 
 async function writeSegmentJob(job) {
   await chrome.storage.local.set({ [await segmentJobKey()]: job });
+}
+
+async function touchSegmentJob(id) {
+  const key = await segmentJobKey();
+  const job = (await chrome.storage.local.get(key))[key];
+  if (job?.id === id) await chrome.storage.local.set({ [key]: { ...job, alive: Date.now() } });
 }
 
 async function storedSegmentJobs() {
@@ -1632,9 +1641,15 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       const progress = (text, count) => showProgress(!segmentLimit && !segmentJob ? text
         : count == null ? `Segment ${segmentNumber}: ${text}`
         : `Segment ${segmentNumber}: loading history... ${count.toLocaleString()} messages in this segment, ${before ? '~' : ''}${(before + count).toLocaleString()} total`, 15);
+      // Each refresh finishes before the next starts, and the last one before the job is written again after the scan.
+      let touching = Promise.resolve();
+      const heartbeat = segmentJob && typeof setInterval === 'function'
+        ? setInterval(() => { touching = touching.then(() => touchSegmentJob(segmentJob.id)).catch(() => {}); }, SEGMENT_HEARTBEAT_MS) : null;
       try {
         history = await scrollToLoadAll(progress, dateFromTs, scanStop.signal, segmentLimit, !!segmentJob);
       } finally {
+        if (heartbeat != null && typeof clearInterval === 'function') clearInterval(heartbeat);
+        await touching;
         historyScanStop = null;
         signal.removeEventListener('abort', forwardCancel);
       }
@@ -1938,7 +1953,7 @@ async function resolveMemoryMessages(messages = null) {
   const [key, job] = jobs.find(([k]) => k === ownKey) || jobs.sort(([, a], [, b]) => (b?.at || 0) - (a?.at || 0))[0] || [];
   if (job?.segments) {
     // Another tab may still be scanning into this job; only a job no scan can still be using is cleared after export.
-    const idle = key === ownKey || job.state === 'finished';
+    const idle = key === ownKey || job.state === 'finished' || Date.now() - Math.max(job.at || 0, job.alive || 0) > SEGMENT_JOB_ALIVE_MS;
     return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments of "${job.name || 'unknown'}"`, name: job.name,
       job: idle ? job : null, jobKey: key };
   }
