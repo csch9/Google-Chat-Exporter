@@ -1640,6 +1640,10 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }
       scanned = history.messages;
       throwIfAborted(signal);
+      if ((initialUrl && !isSameConversationUrl(initialUrl, location.href)) ||
+          (conversationKey && currentConversation()?.key !== conversationKey)) {
+        throw new Error('Conversation changed during export. Please retry.');
+      }
       if (history.reason === 'segment') {
         const target = oldestMessageLink();
         if (target) {
