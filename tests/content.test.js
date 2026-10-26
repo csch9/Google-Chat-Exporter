@@ -1095,6 +1095,29 @@ test('an HTML export that downloads media again drops packaged paths left from e
   assert.equal(packaged.messages[0].media[0]._localPath, undefined, 'the failed attachment links to its original URL');
 });
 
+test('a console export of a wider selection downloads its media again instead of reusing a filtered export\'s parts', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  const pic = (n, ts) => ({ text: n, absoluteTimestamp: ts, media: [{ url: `https://example.com/${n}`, name: n }] });
+  c.scrollToLoadAll = async () => ({ messages: [pic('old', Date.UTC(2020, 0, 1)), pic('new', Date.UTC(2025, 0, 1))], reason: 'date-boundary', warning: '' });
+  const downloaded = [];
+  c.downloadMedia = async url => { downloaded.push(url); return { success: true, base64: 'eA==', mimeType: 'image/png' }; };
+  let fail = true;
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.zip', downloadIds: [1] }; });
+  assert.equal(await c.runExport({ format: 'html', dateFrom: '2024-01-01' }), 'error');
+  assert.deepEqual(downloaded, ['https://example.com/new']);
+  fail = false;
+  assert.equal(await c.gceExportFromMemory(), 'done');
+  assert.deepEqual(Array.from(packaged.messages, m => m.text), ['old', 'new'], 'index.html is rebuilt with every message');
+  assert.equal(packaged.mediaFiles.length, 2, 'the attachment outside the filter is downloaded too');
+});
+
 test('only Chat\'s own creation notice marks the start of a conversation', async () => {
   const c = loadContent();
   await c.loadSelectors();

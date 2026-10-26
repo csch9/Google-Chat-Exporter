@@ -1710,6 +1710,13 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     let mediaFiles = [];
     let mediaFailed = false;
 
+    // Kept media and saved ZIP parts belong to the exact messages they were made for; another selection starts over.
+    const selection = retainedScan?.selection;
+    if (reusedMedia && !(selection?.length === messages.length && selection.every((m, i) => m === messages[i]))) {
+      reusedMedia = null;
+      Object.assign(retainedScan, { media: null, partIds: [] });
+    }
+
     if (format === 'html' && includeMedia && reusedMedia) {
       mediaFiles = reusedMedia.files;
       mediaFailed = reusedMedia.failed;
@@ -1756,6 +1763,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       // Media downloads can take hours; keep them with the scan so a packaging failure can be retried.
       if (retainedScan && retainedScan.history.messages === history.messages) {
         retainedScan.media = { files: mediaFiles, failed: mediaFailed };
+        retainedScan.selection = messages;
         retainedScan.partIds = [];
       }
     }
@@ -1923,7 +1931,7 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
   // Recovered messages may be partial or from another conversation, so they never advance a checkpoint.
   const history = kept ? { ...kept.history, messages } : { messages, reason: 'recovery', warning: '' };
   retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true, name: resolved.name || '',
-    media: kept?.media, partIds: kept?.partIds || [], segmentJob: kept?.segmentJob };
+    media: kept?.media, selection: kept?.selection, partIds: kept?.partIds || [], segmentJob: kept?.segmentJob };
   return runExport({ format, includeMedia, loadAll: true });
 }
 
