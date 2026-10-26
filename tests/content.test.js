@@ -7,9 +7,10 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 // Reassembles staged export chunks the way the background does, then hands the payload to onPackage.
-function packageRecorder(onPackage) {
+function packageRecorder(onPackage, tabId = 1) {
   const staged = { messages: [], mediaFiles: [] };
   return async msg => {
+    if (msg.action === 'getTabId') return { tabId };
     if (msg.action === 'stagePackageParts') {
       staged.messages.push(...(msg.messages || []));
       staged.mediaFiles.push(...(msg.mediaFiles || []));
@@ -19,6 +20,9 @@ function packageRecorder(onPackage) {
     return onPackage({ ...msg.payload, messages: staged.messages.splice(0), mediaFiles: staged.mediaFiles.splice(0) });
   };
 }
+
+// Lets the content script's startup (which may resume a segmented scan) finish before a test swaps in shared storage.
+const settle = () => new Promise(resolve => setImmediate(resolve));
 
 function loadContent() {
   const event = { addListener() {} };
@@ -39,7 +43,7 @@ function loadContent() {
     runtime: {
       getURL(value) { return value; },
       onMessage: event,
-      async sendMessage() { return {}; },
+      async sendMessage(msg) { return msg?.action === 'getTabId' ? { tabId: 1 } : {}; },
       lastError: null
     }
   };
@@ -636,6 +640,7 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
   const page = async (scan) => {
     const c = loadContent();
     await c.loadSelectors();
+    await settle();
     c.chrome.storage.local = storage;
     c.isInChatFrame = () => true;
     c.getConversationName = () => 'Fixture';
@@ -661,7 +666,7 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
   const first = await page({ messages: [msg('b', 2), msg('c', 3)], reason: 'segment', warning: '' });
   assert.equal(await first.c.runExport({ format: 'txt' }), 'segment');
   assert.deepEqual(first.sent.navigations, ['https://chat.google.com/app/chat/SPACE/topic/t1/message/t1']);
-  assert.equal(store.gceSegmentJob.state, 'hop');
+  assert.equal(store['gceSegmentJob:1'].state, 'hop');
   assert.equal(first.sent.packaged, null, 'nothing is packaged before the last segment');
   assert.deepEqual(first.sent.backups, [], 'no backup download while hopping between segments');
 
@@ -670,6 +675,37 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
   assert.deepEqual(Array.from(second.sent.packaged.messages, m => m.text), ['a', 'b', 'c'], 'segments merged without the overlap');
   assert.deepEqual(second.sent.backups, [['a', 'b', 'c']], 'one backup with every segment when the run ends');
   assert.deepEqual(Object.keys(store), [], 'stored segments are cleared after a successful export');
+});
+
+test('segmented scans in two tabs keep separate jobs and segments', async () => {
+  const store = {};
+  const tab = async tabId => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = {
+      async get(keys) {
+        if (keys == null) return { ...store };
+        return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+      },
+      async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+      async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+    };
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => `Tab ${tabId}`;
+    c.showProgress = () => {};
+    c.sleep = async () => {};
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/X/topic/m/message/m', conversation: 'X', message: 'm' });
+    c.scrollToLoadAll = async () => ({ messages: [{ _dedupKey: `t${tabId}`, text: `t${tabId}`, absoluteTimestamp: tabId }], reason: 'segment', warning: '' });
+    const pack = packageRecorder(() => ({ success: true }), tabId);
+    c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? { success: true } : pack(msg);
+    return c;
+  };
+  assert.equal(await (await tab(1)).runExport({ format: 'txt' }), 'segment');
+  assert.equal(await (await tab(2)).runExport({ format: 'txt' }), 'segment');
+  const one = store['gceSegmentJob:1'];
+  assert.ok(one && store['gceSegmentJob:2'], 'both jobs are kept');
+  assert.deepEqual(Array.from(store[`gceSegment:${one.id}:0`], m => m.text), ['t1'], 'tab 1 keeps its segment');
 });
 
 test('oldest-message link follows the app URL, falling back to the copied-link format', async () => {
@@ -768,9 +804,9 @@ test('a reopened segment that stalls is reopened elsewhere, then exported with a
 
   assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'segment');
   assert.equal(navigations.length, 1);
-  assert.equal(store.gceSegmentJob.retries, 1);
+  assert.equal(store['gceSegmentJob:1'].retries, 1);
 
-  assert.equal(await c.runExport({ format: 'txt', segmentJob: { ...store.gceSegmentJob, retries: 10 } }), 'done');
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: { ...store['gceSegmentJob:1'], retries: 10 } }), 'done');
   assert.equal(navigations.length, 1, 'no further reopen once retries run out');
   assert.match(packaged.history.warning, /may be incomplete.*after 10 reopen attempts/);
   assert.equal(packaged.history.reason, 'stalled');
@@ -778,7 +814,7 @@ test('a reopened segment that stalls is reopened elsewhere, then exported with a
 
   // The visible "created this chat" line means the real start was reached: no reopen, no warning.
   c.conversationStartVisible = () => true;
-  store.gceSegmentJob = job;
+  store['gceSegmentJob:1'] = job;
   assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'done');
   assert.equal(navigations.length, 1);
   assert.equal(packaged.history.reason, 'idle');

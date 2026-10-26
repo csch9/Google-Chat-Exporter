@@ -1351,6 +1351,8 @@ async function saveScanBackup(messages, conversationName) {
 // oldest collected message. Segments live in extension storage so they survive the navigation.
 const SEGMENT_JOB_KEY = 'gceSegmentJob';
 const SEGMENT_HOP_MAX_AGE_MS = 10 * 60 * 1000;
+// Jobs of closed or abandoned tabs are removed when a new segmented scan starts.
+const SEGMENT_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // A reopened segment that gains fewer messages than this before going idle is treated as stalled, not as the start.
 let SEGMENT_STALL_MESSAGES = 50;
 const SEGMENT_STALL_RETRIES = 10;
@@ -1390,8 +1392,24 @@ function mergeMessages(...lists) {
   return [...merged.values()].sort((a, b) => (a.absoluteTimestamp || 0) - (b.absoluteTimestamp || 0));
 }
 
+// One job per tab, so segmented scans in two tabs never clear each other's segments.
+async function segmentJobKey() {
+  const resp = await chrome.runtime.sendMessage({ action: 'getTabId' });
+  if (!Number.isInteger(resp?.tabId)) throw new Error('Could not identify this tab for a segmented scan.');
+  return `${SEGMENT_JOB_KEY}:${resp.tabId}`;
+}
+
 async function readSegmentJob() {
-  return (await chrome.storage.local.get(SEGMENT_JOB_KEY))[SEGMENT_JOB_KEY] || null;
+  const key = await segmentJobKey();
+  return (await chrome.storage.local.get(key))[key] || null;
+}
+
+async function writeSegmentJob(job) {
+  await chrome.storage.local.set({ [await segmentJobKey()]: job });
+}
+
+async function storedSegmentJobs() {
+  return Object.entries(await chrome.storage.local.get(null)).filter(([key]) => key.startsWith(`${SEGMENT_JOB_KEY}:`));
 }
 
 async function loadSegments(job) {
@@ -1400,21 +1418,24 @@ async function loadSegments(job) {
   return keys.map(key => data[key] || []);
 }
 
-async function clearSegmentJob(job) {
+async function clearSegmentJob(job, key = null) {
   if (!job) return;
-  await chrome.storage.local.remove([SEGMENT_JOB_KEY, ...Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n))]);
+  await chrome.storage.local.remove([key || await segmentJobKey(), ...Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n))]);
 }
 
 async function hopToNextSegment(job, messages, target, options, retries = 0) {
   if (!job) {
-    await clearSegmentJob(await readSegmentJob());
-    job = { id: Date.now().toString(36), segments: 0, collected: 0, options, name: getConversationName(), startedAt: options.startedAt || Date.now() };
+    const own = await segmentJobKey();
+    for (const [key, old] of await storedSegmentJobs()) {
+      if (key === own || !(Date.now() - (old?.at || 0) < SEGMENT_JOB_MAX_AGE_MS)) await clearSegmentJob(old, key);
+    }
+    job = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, segments: 0, collected: 0, options, name: getConversationName(), startedAt: options.startedAt || Date.now() };
   }
   await chrome.storage.local.set({ [segmentKey(job.id, job.segments)]: messages });
   const next = { ...job, segments: job.segments + 1, collected: job.collected + messages.length, retries,
     stallRetries: (job.stallRetries || 0) + (retries ? 1 : 0),
     link: target.link, conversation: target.conversation, message: target.message, state: 'hop', at: Date.now() };
-  await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: next });
+  await writeSegmentJob(next);
   console.log(`[Google Chat Exporter] segment ${next.segments} stored (${messages.length} messages, ~${next.collected} total); reopening at`, target.link);
   showProgress(`Segment ${next.segments} saved (~${next.collected} messages so far). Reopening Chat at the oldest message to continue...`, 15);
   const resp = await chrome.runtime.sendMessage({ action: 'navigateTab', url: target.link });
@@ -1436,7 +1457,7 @@ async function resumeSegmentJob() {
     stable = now === groups ? stable + 1 : 0;
     groups = now;
   }
-  await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: { ...job, state: 'running' } });
+  await writeSegmentJob({ ...job, state: 'running' });
   // Some workspaces do not open message links; scanning from wherever Chat landed would loop, so export what is stored.
   if (job.message && !document.querySelector(`[${SEL.attrs.groupId}="${job.message}"]`)) {
     console.warn('[Google Chat Exporter] Chat did not open the linked message; exporting the stored segments.');
@@ -1584,7 +1605,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       if (segmentJob) {
         history.messages = mergeMessages(...await loadSegments(segmentJob), history.messages);
         scanned = history.messages;
-        await chrome.storage.local.set({ [SEGMENT_JOB_KEY]: { ...segmentJob, state: 'finished' } });
+        await writeSegmentJob({ ...segmentJob, state: 'finished' });
       }
       history.scanStats = {
         startedAt: new Date(segmentJob?.startedAt || runStartedAt).toISOString(),
@@ -1803,7 +1824,9 @@ async function resolveMemoryMessages(messages = null) {
   await loadSelectors();
   if (messages) return { messages, source: 'argument' };
   if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan' };
-  const job = await readSegmentJob();
+  // A closed or crashed tab leaves its segments behind; recover the most recent job from any tab.
+  const own = await readSegmentJob().catch(() => null);
+  const job = own || (await storedSegmentJobs()).map(([, j]) => j).sort((a, b) => (b?.at || 0) - (a?.at || 0))[0];
   if (job?.segments) return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments` };
   return { messages: extractMessages(), source: 'page' };
 }

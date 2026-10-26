@@ -220,6 +220,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
+  if (msg.action === 'getTabId') {
+    sendResponse({ tabId: sender.tab?.id });
+    return false;
+  }
+
   if (msg.action === 'discardStagedPackage') {
     stagedPackages.delete(mediaRequestKey(sender, msg.stageId));
     sendResponse({ success: true });
