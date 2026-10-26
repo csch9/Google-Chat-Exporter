@@ -1363,11 +1363,16 @@ const QUICK_STALL_BATCH_LIMIT = 3;
 const segmentKey = (jobId, n) => `gceSegment:${jobId}:${n}`;
 
 // Chat shows "<person> created this chat/space" above the first message; English UI only.
+// Only a text node that is exactly that notice counts, and never one inside a message, so a quoted phrase cannot end a scan.
 function conversationStartVisible() {
   if (typeof document.createTreeWalker !== 'function') return false;
   const walker = document.createTreeWalker(findScrollContainer() || document.body, 4 /* NodeFilter.SHOW_TEXT */);
+  const userContent = [SEL.messageText, SEL.messageBubble, SEL.botCardText].filter(Boolean).join(', ');
   for (let i = 0; i < 400 && walker.nextNode(); i++) {
-    if (/\bcreated this (chat|space|group|conversation)\b/i.test(walker.currentNode.nodeValue)) return true;
+    const node = walker.currentNode;
+    if (!/^[^.!?\n]{1,80}\bcreated this (chat|space|group|conversation)\.?$/i.test((node.nodeValue || '').trim())) continue;
+    if (userContent && node.parentElement?.closest?.(userContent)) continue;
+    return true;
   }
   return false;
 }

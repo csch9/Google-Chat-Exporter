@@ -1087,6 +1087,21 @@ test('an HTML export that downloads media again drops packaged paths left from e
   assert.equal(packaged.messages[0].media[0]._localPath, undefined, 'the failed attachment links to its original URL');
 });
 
+test('only Chat\'s own creation notice marks the start of a conversation', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  vm.runInContext("SEL.messageText = 'div.msg'", c);
+  const check = (text, inMessage) => {
+    const node = { nodeValue: text, parentElement: { closest: () => inMessage ? {} : null } };
+    c.document.createTreeWalker = () => { let done = false; return { currentNode: node, nextNode: () => !done && (done = true) }; };
+    c.findScrollContainer = () => ({});
+    return c.conversationStartVisible();
+  };
+  assert.equal(check('Claudio created this chat', false), true);
+  assert.equal(check('I created this chat for the project.', false), false, 'a sentence mentioning it is not the notice');
+  assert.equal(check('Claudio created this chat', true), false, 'a message quoting it is not the notice');
+});
+
 test('exports carry stats about the version, message range and scan', async () => {
   const c = loadContent();
   await c.loadSelectors();
