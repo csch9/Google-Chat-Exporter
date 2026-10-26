@@ -627,6 +627,32 @@ test('HTML media is packaged one part per request and a failed part resumes with
   ], 'index.html travels only with part 1, and part 1 is not repeated on retry');
 });
 
+test('the checkpoint waits for every ZIP part, and the console export resumes at the failed part', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', c);
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b', 'c'].map((n, i) => ({ text: n, absoluteTimestamp: i + 1, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'x'.repeat(6), mimeType: 'image/png' });
+  const parts = [];
+  let failAt = 1;
+  let lastPayload;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    if (payload.part.index === failAt) return { success: false, error: 'killed' };
+    parts.push(payload.part.index);
+    lastPayload = payload;
+    return { success: true, filename: `p${payload.part.index + 1}.zip`, downloadIds: [100 + payload.part.index] };
+  });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  failAt = -1;
+  assert.equal(await c.gceExportFromMemory(), 'done');
+  assert.deepEqual(parts, [0, 1, 2], 'parts saved before the failure are not repeated');
+  assert.deepEqual(Array.from(lastPayload.partDownloads), [100, 101], 'the last part carries the earlier parts\' downloads');
+});
 test('long scans hop to a fresh page at the oldest message and the resumed page exports all segments', async () => {
   const store = {};
   const storage = {

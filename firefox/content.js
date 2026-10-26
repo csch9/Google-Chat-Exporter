@@ -1696,6 +1696,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       if (retainedScan && retainedScan.history.messages === history.messages) {
         retainedScan.media = { files: mediaFiles, failed: mediaFailed };
         retainedScan.partsDone = 0;
+        retainedScan.partDownloads = [];
       }
     }
 
@@ -1727,17 +1728,20 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }
       const resumable = retainedScan?.media?.files === mediaFiles;
       const first = resumable ? retainedScan.partsDone || 0 : 0;
+      // The checkpoint waits for every part's download, including parts saved by an earlier attempt.
+      const downloads = resumable ? [...(retainedScan.partDownloads || [])] : [];
       const filenames = [];
       for (let i = first; i < chunks.length; i++) {
         showProgress(`📦 Packaging part ${i + 1}/${chunks.length}...`, 88 + Math.round((i / chunks.length) * 11));
         const last = i === chunks.length - 1;
         resp = await sendPackage(format, {
           conversationName, messages: i === 0 ? messages : [], mediaFiles: chunks[i], exportDate, sourceUrl, stats,
-          history: historyInfo, checkpoint: last ? checkpoint : null, part: { index: i, count: chunks.length }
+          history: historyInfo, checkpoint: last ? checkpoint : null, partDownloads: last ? [...downloads] : [], part: { index: i, count: chunks.length }
         });
         if (!resp?.success) break;
         filenames.push(resp.filename);
-        if (resumable) retainedScan.partsDone = i + 1;
+        downloads.push(...(resp.downloadIds || []));
+        if (resumable) Object.assign(retainedScan, { partsDone: i + 1, partDownloads: [...downloads] });
       }
       if (resp?.success) resp = { ...resp, filename: filenames.join(', '), parts: chunks.length };
     } else {
@@ -1835,8 +1839,10 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
   const resolved = await resolveMemoryMessages(messages);
   messages = resolved.messages;
   console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${resolved.source} as ${format}${includeMedia ? ' + media' : ''}`);
-  const media = retainedScan?.history?.messages === messages ? retainedScan.media : undefined;
-  retainedScan = { url: location.href, dateFromTs: 0, history: { messages, reason: 'idle', warning: '' }, at: Date.now(), manual: true, media };
+  // Re-running after a failed ZIP part continues with that part instead of repeating saved ones.
+  const kept = retainedScan?.history?.messages === messages ? retainedScan : null;
+  retainedScan = { url: location.href, dateFromTs: 0, history: { messages, reason: 'idle', warning: '' }, at: Date.now(), manual: true,
+    media: kept?.media, partsDone: kept?.partsDone || 0, partDownloads: kept?.partDownloads || [] };
   return runExport({ format, includeMedia, loadAll: true });
 }
 

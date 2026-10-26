@@ -17,13 +17,15 @@ function serializeCheckpoint(work) {
   return next;
 }
 
+// A multi-part export is pending under each part's download and advances only once every part completed.
 async function reconcileCheckpoint(downloadId) {
   const pendingKey = `gcePending:${downloadId}`;
   const pending = (await chrome.storage.local.get(pendingKey))[pendingKey];
   if (!pending) return;
-  const [download] = await chrome.downloads.search({ id: downloadId });
-  if (download?.state === 'in_progress') return;
-  if (download?.state === 'complete') {
+  const ids = pending.downloads || [downloadId];
+  const states = await Promise.all(ids.map(async id => (await chrome.downloads.search({ id }))[0]?.state));
+  if (states.includes('in_progress')) return;
+  if (states.every(state => state === 'complete')) {
     const old = (await chrome.storage.local.get(pending.key))[pending.key];
     if (!old || pending.value.timestamp > old.timestamp) {
       await chrome.storage.local.set({ [pending.key]: pending.value });
@@ -32,19 +34,22 @@ async function reconcileCheckpoint(downloadId) {
       await chrome.storage.local.set({ [pending.key]: { ...old, fingerprints } });
     }
   }
-  await chrome.storage.local.remove(pendingKey);
+  await chrome.storage.local.remove(ids.map(id => `gcePending:${id}`));
 }
 
-function queueCheckpoint(downloadId, checkpoint) {
-  if (!/^gceCheckpoint:[a-f0-9]{64}$/.test(checkpoint.key) ||
+function queueCheckpoint(downloadIds, checkpoint) {
+  const ids = [].concat(downloadIds);
+  if (!ids.length || !ids.every(Number.isInteger) ||
+      !/^gceCheckpoint:[a-f0-9]{64}$/.test(checkpoint.key) ||
       !Number.isFinite(checkpoint.value?.timestamp) || checkpoint.value.timestamp <= 0 ||
       !Array.isArray(checkpoint.value.fingerprints) ||
       !checkpoint.value.fingerprints.every(id => /^[a-f0-9]{64}$/.test(id))) {
     throw new Error('Invalid checkpoint');
   }
+  const pending = { ...checkpoint, downloads: ids };
   return serializeCheckpoint(async () => {
-    await chrome.storage.local.set({ [`gcePending:${downloadId}`]: checkpoint });
-    await reconcileCheckpoint(downloadId);
+    await chrome.storage.local.set(Object.fromEntries(ids.map(id => [`gcePending:${id}`, pending])));
+    await reconcileCheckpoint(ids[ids.length - 1]);
   });
 }
 
@@ -257,7 +262,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           : await packageTxt(payload);
         let checkpointWarning = '';
         if (payload.checkpoint) {
-          try { await queueCheckpoint(result.downloadId, payload.checkpoint); }
+          try { await queueCheckpoint([...(payload.partDownloads || []), ...result.downloadIds], payload.checkpoint); }
           catch { checkpointWarning = 'Export downloaded, but its checkpoint could not be saved. Next export may repeat messages.'; }
         }
         sendResponse({ success: true, ...result, checkpointWarning });
@@ -495,7 +500,7 @@ async function packageTxt({ conversationName, messages, exportDate, history, sta
   const dataUrl = 'data:text/plain;charset=utf-8;base64,' + b64EncodeUtf8(fullText);
 
   const downloadId = await triggerDownload(dataUrl, filename);
-  return { filename, downloadId };
+  return { filename, downloadId, downloadIds: [downloadId] };
 }
 
 // ── HTML + ZIP Packaging ────────────────────────────────────
@@ -518,7 +523,7 @@ async function packageHtml({ conversationName, messages, mediaFiles, exportDate,
 
   const base = `${sanitize(name)}_${dateStr()}`;
   const filenames = [];
-  let downloadId;
+  const downloadIds = [];
   for (let i = 0; i < parts.length; i++) {
     const zip = new JSZip();
     if (offset + i === 0) {
@@ -529,10 +534,10 @@ async function packageHtml({ conversationName, messages, mediaFiles, exportDate,
     for (const file of parts[i]) zip.file(file.path, file.base64, { base64: true });
     const zipBase64 = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', compressionOptions: { level: 6 } });
     const filename = count > 1 ? `${base}_part${offset + i + 1}of${count}.zip` : `${base}.zip`;
-    downloadId = await triggerDownload('data:application/zip;base64,' + zipBase64, filename);
+    downloadIds.push(await triggerDownload('data:application/zip;base64,' + zipBase64, filename));
     filenames.push(filename);
   }
-  return { filename: filenames.join(', '), downloadId, parts: count };
+  return { filename: filenames.join(', '), downloadId: downloadIds[downloadIds.length - 1], downloadIds, parts: count };
 }
 
 // ── HTML Generator ──────────────────────────────────────────

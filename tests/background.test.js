@@ -23,7 +23,7 @@ function loadBackground() {
     storage: { local: {
       async get(key) { return key ? { [key]: stored[key] } : { ...stored }; },
       async set(values) { Object.assign(stored, values); },
-      async remove(key) { delete stored[key]; }
+      async remove(keys) { [].concat(keys).forEach(key => delete stored[key]); }
     }, session: {
       async get(key) { return { [key]: session[key] }; },
       async set(values) { Object.assign(session, values); }
@@ -183,6 +183,25 @@ test('staged export chunks are merged into one package and cleared afterwards', 
   const partial = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's2', payload, expected: { messages: 2, mediaFiles: 0 } });
   assert.equal(partial.success, false);
   assert.match(partial.error, /incomplete/);
+});
+
+test('a multi-part checkpoint advances only when every part has completed', async () => {
+  const c = loadBackground();
+  const states = { 1: 'interrupted', 2: 'complete' };
+  c.chrome.downloads.search = async ({ id }) => [{ state: states[id] }];
+  const key = 'gceCheckpoint:' + 'a'.repeat(64);
+  await c.queueCheckpoint([1, 2], { key, value: { timestamp: 100, fingerprints: [] } });
+  assert.equal((await c.chrome.storage.local.get(key))[key], undefined, 'an interrupted earlier part blocks the checkpoint');
+  assert.equal((await c.chrome.storage.local.get('gcePending:1'))['gcePending:1'], undefined);
+
+  states[1] = 'in_progress';
+  await c.queueCheckpoint([1, 2], { key, value: { timestamp: 100, fingerprints: [] } });
+  assert.equal((await c.chrome.storage.local.get(key))[key], undefined);
+  states[1] = 'complete';
+  c.chrome.downloads.onChanged.listener({ id: 1, state: { current: 'complete' } });
+  await vm.runInContext('checkpointQueue', c);
+  assert.equal((await c.chrome.storage.local.get(key))[key].timestamp, 100);
+  assert.equal((await c.chrome.storage.local.get('gcePending:2'))['gcePending:2'], undefined);
 });
 
 test('saved TXT and HTML carry incomplete-history warnings', async () => {
