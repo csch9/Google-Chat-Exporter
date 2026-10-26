@@ -892,6 +892,65 @@ test('segmented scans in two tabs keep separate jobs and segments', async () => 
   assert.deepEqual(Array.from(store[`gceSegment:${one.id}:0`], m => m.text), ['t1'], 'tab 1 keeps its segment');
 });
 
+test('stored segment jobs stay recoverable: a new scan keeps the old job, a failed merge keeps the count, and recovery cleans up', async () => {
+  const store = {};
+  let failSegmentReads = false;
+  const setup = async () => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = {
+      async get(keys) {
+        if (keys == null) return { ...store };
+        if (failSegmentReads && Array.isArray(keys)) throw new Error('storage unavailable');
+        return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+      },
+      async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+      async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+    };
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => 'Fixture';
+    c.showProgress = () => {};
+    c.saveScanBackup = () => {};
+    vm.runInContext('SEGMENT_STALL_MESSAGES = 0', c);
+    c.sleep = async () => {};
+    c.location = { href: 'https://chat.google.com/app/chat/B' };
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/B/topic/m/message/m', conversation: 'B', message: 'm' });
+    const pack = packageRecorder(() => ({ success: true, filename: 'x.txt' }));
+    c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? { success: true } : pack(msg);
+    return c;
+  };
+  const msg = text => ({ _dedupKey: text, text, absoluteTimestamp: 1 });
+
+  // A's export failed earlier; B's scan in the same tab reaches its first segment boundary.
+  Object.assign(store, { 'gceSegmentJob:1': { id: 'a', segments: 1, name: 'A', state: 'finished', at: Date.now() }, 'gceSegment:a:0': [msg('a')] });
+  const b = await setup();
+  b.scrollToLoadAll = async () => ({ messages: [msg('b')], reason: 'segment', warning: '' });
+  assert.equal(await b.runExport({ format: 'txt' }), 'segment');
+  assert.equal(store['gceSegmentJob:recovery:a']?.name, 'A', 'A\'s job moved to a recovery key');
+  assert.deepEqual(Array.from(store['gceSegment:a:0'], m => m.text), ['a']);
+
+  // Reading the segments fails after B's last page: the stored job already counts that page.
+  const last = await setup();
+  last.scrollToLoadAll = async () => ({ messages: [msg('b0')], reason: 'idle', warning: '' });
+  failSegmentReads = true;
+  assert.equal(await last.runExport({ format: 'txt', segmentJob: store['gceSegmentJob:1'] }), 'error');
+  failSegmentReads = false;
+  assert.equal(store['gceSegmentJob:1'].segments, 2);
+  assert.ok(store[`gceSegment:${store['gceSegmentJob:1'].id}:1`], 'the last page is stored');
+
+  // A console export of this tab's stored job clears it; a recent job still running in another tab is left alone.
+  store['gceSegmentJob:7'] = { id: 'r', segments: 1, name: 'Running', state: 'running', at: Date.now() + 1 };
+  store['gceSegment:r:0'] = [msg('r')];
+  const recover = await setup();
+  assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(store['gceSegmentJob:1'], undefined, 'the recovered job is cleared');
+  vm.runInContext('retainedScan = null', recover);
+  await recover.chrome.storage.local.remove('gceSegmentJob:recovery:a');
+  assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.ok(store['gceSegmentJob:7'] && store['gceSegment:r:0'], 'the other tab\'s running job is kept');
+});
+
 test('oldest-message link follows the app URL, falling back to the copied-link format', async () => {
   const c = loadContent();
   const sel = await c.loadSelectors();

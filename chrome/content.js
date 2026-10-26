@@ -1445,7 +1445,9 @@ async function hopToNextSegment(job, messages, target, options, retries = 0) {
   if (!job) {
     const own = await segmentJobKey();
     for (const [key, old] of await storedSegmentJobs()) {
-      if (key === own || !(Date.now() - (old?.at || 0) < SEGMENT_JOB_MAX_AGE_MS)) await clearSegmentJob(old, key);
+      if (!(Date.now() - (old?.at || 0) < SEGMENT_JOB_MAX_AGE_MS)) await clearSegmentJob(old, key);
+      // The tab's previous job may hold a scan that was never exported; keep it recoverable under its own key.
+      else if (key === own && old?.id) await chrome.storage.local.set({ [`${SEGMENT_JOB_KEY}:recovery:${old.id}`]: old });
     }
     job = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, segments: 0, collected: 0, options, name: getConversationName(), startedAt: options.startedAt || Date.now() };
   }
@@ -1596,12 +1598,15 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
 
     let reusedMedia = null;
     let ownedJob = segmentJob;
+    // Recovered jobs may live under another tab's key or a recovery key; null means this tab's own key.
+    let ownedJobKey = null;
     // Recovered scans keep the name of the conversation they came from, which may not be the open one.
     let recoveredName = '';
     if (loadAll && retainedScan && (retainedScan.manual || (scanOptions.retryReuse && conversationKey && retainedScan.conversation === conversationKey)) &&
         retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
       // A kept scan from a segmented run still owns that run's stored segments until an export succeeds.
       ownedJob = segmentJob || retainedScan.segmentJob || null;
+      if (!segmentJob) ownedJobKey = retainedScan.segmentJobKey || null;
       if (retainedScan.manual) recoveredName = retainedScan.name || '';
       history = { ...retainedScan.history };
       // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
@@ -1662,13 +1667,13 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         console.warn(`[Google Chat Exporter] ${history.warning}`);
       }
       if (segmentJob) {
-        // Stored before anything slow runs, so a crash during media download or packaging can still recover it.
-        await chrome.storage.local.set({ [segmentKey(segmentJob.id, segmentJob.segments)]: history.messages });
-        segmentJob = { ...segmentJob, segments: segmentJob.segments + 1, state: 'finished' };
+        // Stored with the updated job before anything slow runs, so a crash or failure from here on can still recover it.
+        const finished = { ...segmentJob, segments: segmentJob.segments + 1, state: 'finished' };
+        await chrome.storage.local.set({ [segmentKey(segmentJob.id, segmentJob.segments)]: history.messages, [await segmentJobKey()]: finished });
+        segmentJob = finished;
         ownedJob = segmentJob;
         history.messages = mergeMessages(...await loadSegments(segmentJob));
         scanned = history.messages;
-        await writeSegmentJob(segmentJob);
       }
       history.scanStats = {
         startedAt: new Date(segmentJob?.startedAt || runStartedAt).toISOString(),
@@ -1842,7 +1847,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         const keep = saved !== 'complete';
         if (!keep) {
           retainedScan = null;
-          if (ownedJob) await clearSegmentJob(ownedJob).catch(() => {});
+          if (ownedJob) await clearSegmentJob(ownedJob, ownedJobKey).catch(() => {});
         }
         const parts = resp.parts > 1 ? ` Extract all ${resp.parts} parts into the same folder.` : '';
         const next = auto ? ' Auto-export: open the next channel.' : '';
@@ -1924,9 +1929,15 @@ async function resolveMemoryMessages(messages = null) {
   if (messages) return { messages, source: 'argument' };
   if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan', name: retainedScan.name };
   // A closed or crashed tab leaves its segments behind; recover the most recent job from any tab.
-  const own = await readSegmentJob().catch(() => null);
-  const job = own || (await storedSegmentJobs()).map(([, j]) => j).sort((a, b) => (b?.at || 0) - (a?.at || 0))[0];
-  if (job?.segments) return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments of "${job.name || 'unknown'}"`, name: job.name };
+  const ownKey = await segmentJobKey().catch(() => '');
+  const jobs = await storedSegmentJobs();
+  const [key, job] = jobs.find(([k]) => k === ownKey) || jobs.sort(([, a], [, b]) => (b?.at || 0) - (a?.at || 0))[0] || [];
+  if (job?.segments) {
+    // Another tab may still be scanning into this job; only a job no scan can still be using is cleared after export.
+    const idle = key === ownKey || job.state === 'finished' || Date.now() - (job.at || 0) > SEGMENT_HOP_MAX_AGE_MS;
+    return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments of "${job.name || 'unknown'}"`, name: job.name,
+      job: idle ? job : null, jobKey: key };
+  }
   return { messages: extractMessages(), source: 'page' };
 }
 
@@ -1939,7 +1950,8 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
   // Recovered messages may be partial or from another conversation, so they never advance a checkpoint.
   const history = kept ? { ...kept.history, messages } : { messages, reason: 'recovery', warning: '' };
   retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true, name: resolved.name || '',
-    media: kept?.media, selection: kept?.selection, partIds: kept?.partIds || [], segmentJob: kept?.segmentJob };
+    media: kept?.media, selection: kept?.selection, partIds: kept?.partIds || [],
+    segmentJob: kept ? kept.segmentJob : resolved.job, segmentJobKey: kept ? kept.segmentJobKey : resolved.jobKey };
   return runExport({ format, includeMedia, loadAll: true });
 }
 
