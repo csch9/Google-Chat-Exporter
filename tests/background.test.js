@@ -170,7 +170,7 @@ test('staged export chunks are merged into one package and cleared afterwards', 
   await send({ action: 'stagePackageParts', stageId: 's1', messages: [{ sender: 'A', timestamp: '1', text: 'one', media: [] }] });
   await send({ action: 'stagePackageParts', stageId: 's1', messages: [{ sender: 'B', timestamp: '2', text: 'two', media: [] }] });
   const payload = { conversationName: 'Fixture', exportDate: new Date().toISOString(), history: { reason: 'idle' } };
-  const response = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's1', payload });
+  const response = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's1', payload, expected: { messages: 2, mediaFiles: 0 } });
   assert.equal(response.success, true);
   const text = Buffer.from(download.url.split(',')[1], 'base64').toString();
   assert.match(text, /one/);
@@ -178,6 +178,11 @@ test('staged export chunks are merged into one package and cleared afterwards', 
   assert.equal(vm.runInContext('stagedPackages.size', c), 0);
   const lost = await send({ action: 'packageAndDownload', format: 'txt', stageId: 'missing', payload });
   assert.equal(lost.success, false);
+  // Simulates a worker restart after the first chunk: only the later chunk reached this stage.
+  await send({ action: 'stagePackageParts', stageId: 's2', messages: [{ sender: 'B', timestamp: '2', text: 'two', media: [] }] });
+  const partial = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's2', payload, expected: { messages: 2, mediaFiles: 0 } });
+  assert.equal(partial.success, false);
+  assert.match(partial.error, /incomplete/);
 });
 
 test('saved TXT and HTML carry incomplete-history warnings', async () => {

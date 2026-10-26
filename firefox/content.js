@@ -1469,7 +1469,8 @@ async function sendPackage(format, payload) {
       if (size >= 16_000_000) { await stage({ mediaFiles: batch }); batch = []; size = 0; }
     }
     if (batch.length) await stage({ mediaFiles: batch });
-    return await chrome.runtime.sendMessage({ action: 'packageAndDownload', format, stageId, payload: rest });
+    return await chrome.runtime.sendMessage({ action: 'packageAndDownload', format, stageId, payload: rest,
+      expected: { messages: messages.length, mediaFiles: mediaFiles.length } });
   } catch (error) {
     try { await chrome.runtime.sendMessage({ action: 'discardStagedPackage', stageId }); } catch { /* worker may be gone */ }
     throw error;

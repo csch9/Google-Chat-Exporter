@@ -235,6 +235,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.stageId) {
           const staged = stagedPackages.get(stageKey);
           if (!staged) throw new Error('Export data was lost before packaging. Please retry.');
+          // A worker restart mid-transfer starts a fresh stage that lacks the earlier chunks.
+          if (staged.messages.length !== msg.expected?.messages || staged.mediaFiles.length !== msg.expected?.mediaFiles) {
+            throw new Error('Export data was incomplete before packaging. Please retry.');
+          }
           payload = { ...msg.payload, messages: staged.messages, mediaFiles: staged.mediaFiles };
         }
         if (payload.sourceUrl && sender.tab?.id) {
