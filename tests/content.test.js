@@ -747,7 +747,11 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
     c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1', conversation: 'SPACE' });
     c.scrollToLoadAll = async () => scan;
     const sent = { navigations: [], packaged: null, backups };
-    const pack = packageRecorder(payload => { sent.packaged = payload; return { success: true, filename: 'x.txt' }; });
+    const pack = packageRecorder(payload => {
+      sent.packaged = payload;
+      sent.storedAtPackaging = Object.keys(store).filter(k => k.startsWith('gceSegment:')).length;
+      return { success: true, filename: 'x.txt' };
+    });
     c.chrome.runtime.sendMessage = async msg => {
       if (msg.action === 'navigateTab') { sent.navigations.push(msg.url); return { success: true }; }
       return pack(msg);
@@ -766,6 +770,7 @@ test('long scans hop to a fresh page at the oldest message and the resumed page 
   const second = await page({ messages: [msg('a', 1), msg('b', 2)], reason: 'idle', warning: '' });
   assert.equal(await second.c.resumeSegmentJob(), 'done');
   assert.deepEqual(Array.from(second.sent.packaged.messages, m => m.text), ['a', 'b', 'c'], 'segments merged without the overlap');
+  assert.equal(second.sent.storedAtPackaging, 2, 'the last segment is stored before packaging, so a crash cannot lose it');
   assert.deepEqual(second.sent.backups, [['a', 'b', 'c']], 'one backup with every segment when the run ends');
   assert.deepEqual(Object.keys(store), [], 'stored segments are cleared after a successful export');
 });

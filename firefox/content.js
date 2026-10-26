@@ -1662,14 +1662,18 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         console.warn(`[Google Chat Exporter] ${history.warning}`);
       }
       if (segmentJob) {
-        history.messages = mergeMessages(...await loadSegments(segmentJob), history.messages);
+        // Stored before anything slow runs, so a crash during media download or packaging can still recover it.
+        await chrome.storage.local.set({ [segmentKey(segmentJob.id, segmentJob.segments)]: history.messages });
+        segmentJob = { ...segmentJob, segments: segmentJob.segments + 1, state: 'finished' };
+        ownedJob = segmentJob;
+        history.messages = mergeMessages(...await loadSegments(segmentJob));
         scanned = history.messages;
-        await writeSegmentJob({ ...segmentJob, state: 'finished' });
+        await writeSegmentJob(segmentJob);
       }
       history.scanStats = {
         startedAt: new Date(segmentJob?.startedAt || runStartedAt).toISOString(),
         seconds: Math.round((Date.now() - (segmentJob?.startedAt || runStartedAt)) / 1000),
-        segments: segmentJob ? segmentJob.segments + 1 : 1,
+        segments: segmentJob ? segmentJob.segments : 1,
         stallRetries: segmentJob?.stallRetries || 0
       };
       retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now(), segmentJob, name: getConversationName() } : null;
