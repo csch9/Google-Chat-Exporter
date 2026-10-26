@@ -1473,7 +1473,7 @@ async function resumeSegmentJob() {
     console.warn('[Google Chat Exporter] Chat did not open the linked message; exporting the stored segments.');
     const messages = mergeMessages(...await loadSegments(job));
     const dateFrom = job.options?.dateFrom || '';
-    retainedScan = { url: location.href, dateFromTs: dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0, at: Date.now(), manual: true,
+    retainedScan = { url: location.href, dateFromTs: dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0, at: Date.now(), manual: true, segmentJob: job,
       history: { messages, reason: 'limit', warning: 'Chat could not reopen at an older message, so the segmented scan ended early; older messages may be missing. Turn off segmented scanning and export again for the full history.' } };
     return runExport({ ...job.options, sourceUrl: '', segmentJob: job });
   }
@@ -1569,10 +1569,11 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     const dateFromTs = previous?.timestamp || (dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0);
 
     let reusedMedia = null;
-    // A kept scan from a segmented run still owns that run's stored segments until an export succeeds.
-    const ownedJob = segmentJob || retainedScan?.segmentJob || null;
+    let ownedJob = segmentJob;
     if (loadAll && retainedScan && (retainedScan.manual || (scanOptions.retryReuse && conversationKey && retainedScan.conversation === conversationKey)) &&
         retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
+      // A kept scan from a segmented run still owns that run's stored segments until an export succeeds.
+      ownedJob = segmentJob || retainedScan.segmentJob || null;
       history = { ...retainedScan.history };
       // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
       history.warning = retainedScan.manual ? (history.warning || '')

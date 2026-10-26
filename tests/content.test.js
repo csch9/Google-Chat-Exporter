@@ -781,6 +781,26 @@ test('a resumed page finds the linked message by either ID, backs up stored segm
   assert.equal(await retry.c.runExport({ format: 'txt' }), 'done');
   assert.equal(retry.sent.scans, 1, 'the retry reused the kept scan');
   assert.deepEqual(Object.keys(store), [], 'the retry cleared the job');
+
+  // Chat did not open the link and packaging failed: a plain retry still clears that job.
+  await hop();
+  failing = true;
+  const unopened = await page({ scan: null, onPage: () => false, fail: () => failing });
+  assert.equal(await unopened.c.resumeSegmentJob(), 'error');
+  failing = false;
+  assert.equal(await unopened.c.runExport({ format: 'txt' }), 'done');
+  assert.deepEqual(Object.keys(store), [], 'the retry cleared the job');
+
+  // A fresh export of another conversation leaves the failed run's segments for recovery.
+  await hop();
+  failing = true;
+  const other = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' }, fail: () => failing });
+  assert.equal(await other.c.resumeSegmentJob(), 'error');
+  failing = false;
+  other.c.location = { href: 'https://chat.google.com/app/chat/OTHER' };
+  assert.equal(await other.c.runExport({ format: 'txt' }), 'done');
+  assert.equal(other.sent.scans, 2, 'the other conversation was scanned');
+  assert.ok(Object.keys(store).length, 'the failed run\'s segments are kept');
 });
 
 test('segmented scans in two tabs keep separate jobs and segments', async () => {
