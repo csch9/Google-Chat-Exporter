@@ -1689,6 +1689,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       mediaFailed = reusedMedia.failed;
       showProgress(`Reusing ${mediaFiles.length} downloaded attachments...`, 85);
     } else if (format === 'html' && includeMedia) {
+      // Paths from an earlier, abandoned download (or an imported backup) would point at files this ZIP lacks.
+      messages.forEach(m => (m.media || []).forEach(x => { delete x._localPath; }));
       // Download all media
       let totalMedia = 0;
       messages.forEach(m => { totalMedia += (m.media || []).filter(x => x.url).length; });

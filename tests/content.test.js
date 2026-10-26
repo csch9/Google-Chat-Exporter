@@ -1048,6 +1048,22 @@ test('walking up through already-loaded history keeps the scan alive; a scroll t
   assert.match(stuck.result.warning, /may be missing/);
 });
 
+test('an HTML export that downloads media again drops packaged paths left from earlier attempts', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  c.downloadMedia = async () => ({ success: false });
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.zip' }; });
+  const imported = [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png', _localPath: 'media/1_p.png' }] }];
+  assert.equal(await c.gceExportFromMemory(imported), 'done');
+  assert.equal(packaged.messages[0].media[0]._localPath, undefined, 'the failed attachment links to its original URL');
+});
+
 test('exports carry stats about the version, message range and scan', async () => {
   const c = loadContent();
   await c.loadSelectors();
