@@ -183,6 +183,14 @@ test('staged export chunks are merged into one package and cleared afterwards', 
   const partial = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's2', payload, expected: { messages: 2, mediaFiles: 0 } });
   assert.equal(partial.success, false);
   assert.match(partial.error, /incomplete/);
+
+  // An oversized attachment arrives in pieces; a missing piece leaves it out and fails the count check.
+  for (const [index, base64] of [[0, 'eA'], [1, '==']]) {
+    await send({ action: 'stagePackageParts', stageId: 's3', mediaPiece: { path: 'media/v', mimeType: 'video/mp4', index, count: 2, base64 } });
+  }
+  assert.equal(vm.runInContext("stagedPackages.get('5:0:s3').mediaFiles[0].base64", c), 'eA==');
+  await send({ action: 'stagePackageParts', stageId: 's4', mediaPiece: { path: 'media/v', index: 1, count: 2, base64: '==' } });
+  assert.equal(vm.runInContext("stagedPackages.get('5:0:s4').mediaFiles.length", c), 0);
 });
 
 test('a multi-part checkpoint advances only when every part has completed', async () => {

@@ -1473,6 +1473,7 @@ async function resumeSegmentJob() {
 
 // Resolves to 'done', 'empty', 'error', 'cancelled' or 'busy'.
 // A single runtime message is capped at 64 MiB, so large exports are staged in the background in chunks.
+let MEDIA_CHUNK_CHARS = 16_000_000;
 async function sendPackage(format, payload) {
   const stageId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const { messages, mediaFiles, ...rest } = payload;
@@ -1485,6 +1486,16 @@ async function sendPackage(format, payload) {
     let batch = [];
     let size = 0;
     for (const file of mediaFiles) {
+      // A single large attachment would exceed the message limit on its own; the background joins its pieces.
+      if (file.base64.length > MEDIA_CHUNK_CHARS) {
+        if (batch.length) { await stage({ mediaFiles: batch }); batch = []; size = 0; }
+        const count = Math.ceil(file.base64.length / MEDIA_CHUNK_CHARS);
+        for (let index = 0; index < count; index++) {
+          await stage({ mediaPiece: { path: file.path, mimeType: file.mimeType, index, count,
+            base64: file.base64.slice(index * MEDIA_CHUNK_CHARS, (index + 1) * MEDIA_CHUNK_CHARS) } });
+        }
+        continue;
+      }
       batch.push(file);
       size += file.base64.length;
       if (size >= 16_000_000) { await stage({ mediaFiles: batch }); batch = []; size = 0; }

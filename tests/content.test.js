@@ -935,6 +935,18 @@ test('console export packages on-page messages with media as a complete export, 
   assert.equal(packaged.history.warning, '');
 });
 
+test('an attachment larger than one message is staged in pieces and joined in order', async () => {
+  const c = loadContent();
+  vm.runInContext('MEDIA_CHUNK_CHARS = 4', c);
+  const sent = [];
+  c.chrome.runtime.sendMessage = async msg => { sent.push(msg); return { success: true }; };
+  await c.sendPackage('html', { messages: [], mediaFiles: [{ path: 'media/a', base64: 'aa' }, { path: 'media/big', mimeType: 'video/mp4', base64: '0123456789' }] });
+  const pieces = sent.filter(m => m.mediaPiece).map(m => [m.mediaPiece.index, m.mediaPiece.count, m.mediaPiece.base64]);
+  assert.deepEqual(pieces, [[0, 3, '0123'], [1, 3, '4567'], [2, 3, '89']]);
+  assert.deepEqual(Array.from(sent.find(m => m.mediaFiles).mediaFiles, f => f.path), ['media/a']);
+  assert.deepEqual({ ...sent.at(-1).expected }, { messages: 0, mediaFiles: 2 });
+});
+
 test('advanced scan options turn off segmentation, retry reuse and backups; stopping always keeps messages', async () => {
   const c = loadContent();
   await c.loadSelectors();

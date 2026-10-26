@@ -220,6 +220,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const staged = stagedPackages.get(key) || { messages: [], mediaFiles: [] };
     for (const item of msg.messages || []) staged.messages.push(item);
     for (const item of msg.mediaFiles || []) staged.mediaFiles.push(item);
+    // An attachment too large for one message arrives in order; a gap leaves it out and fails the count check.
+    const piece = msg.mediaPiece;
+    if (piece) {
+      if (piece.index === 0) staged.pieces = [];
+      if (staged.pieces?.length === piece.index) staged.pieces.push(piece.base64);
+      else staged.pieces = null;
+      if (staged.pieces && piece.index === piece.count - 1) {
+        staged.mediaFiles.push({ path: piece.path, mimeType: piece.mimeType, base64: staged.pieces.join('') });
+        staged.pieces = null;
+      }
+    }
     stagedPackages.set(key, staged);
     sendResponse({ success: true });
     return false;
