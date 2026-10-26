@@ -1725,8 +1725,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       // Media downloads can take hours; keep them with the scan so a packaging failure can be retried.
       if (retainedScan && retainedScan.history.messages === history.messages) {
         retainedScan.media = { files: mediaFiles, failed: mediaFailed };
-        retainedScan.partsDone = 0;
-        retainedScan.partDownloads = [];
+        retainedScan.partIds = [];
       }
     }
 
@@ -1757,21 +1756,27 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         size += file.base64.length;
       }
       const resumable = retainedScan?.media?.files === mediaFiles;
-      const first = resumable ? retainedScan.partsDone || 0 : 0;
-      // The checkpoint waits for every part's download, including parts saved by an earlier attempt.
-      const downloads = resumable ? [...(retainedScan.partDownloads || [])] : [];
+      // Download IDs per saved part; a part whose download did not complete is packaged again.
+      const done = resumable ? [...(retainedScan.partIds || [])] : [];
+      const savedIds = done.flatMap(ids => ids || []);
+      if (savedIds.length) {
+        const states = (await chrome.runtime.sendMessage({ action: 'downloadStates', ids: savedIds }).catch(() => null))?.states || {};
+        done.forEach((ids, i) => { if (ids && !ids.every(id => ['complete', 'in_progress'].includes(states[id]))) done[i] = undefined; });
+      }
+      const pending = chunks.map((_, i) => i).filter(i => !done[i]);
       const filenames = [];
-      for (let i = first; i < chunks.length; i++) {
+      resp = pending.length ? null : { success: true };
+      for (const i of pending) {
         showProgress(`📦 Packaging part ${i + 1}/${chunks.length}...`, 88 + Math.round((i / chunks.length) * 11));
-        const last = i === chunks.length - 1;
+        const last = i === pending[pending.length - 1];
         resp = await sendPackage(format, {
           conversationName, messages: i === 0 ? messages : [], mediaFiles: chunks[i], exportDate, sourceUrl, stats,
-          history: historyInfo, checkpoint: last ? checkpoint : null, partDownloads: last ? [...downloads] : [], part: { index: i, count: chunks.length }
+          history: historyInfo, checkpoint: last ? checkpoint : null, partDownloads: last ? done.flatMap(ids => ids || []) : [], part: { index: i, count: chunks.length }
         });
         if (!resp?.success) break;
         filenames.push(resp.filename);
-        downloads.push(...(resp.downloadIds || []));
-        if (resumable) Object.assign(retainedScan, { partsDone: i + 1, partDownloads: [...downloads] });
+        done[i] = resp.downloadIds || [];
+        if (resumable) retainedScan.partIds = [...done];
       }
       if (resp?.success) resp = { ...resp, filename: filenames.join(', '), parts: chunks.length };
     } else {
@@ -1874,7 +1879,7 @@ async function gceExportFromMemory(messages = null, { format = 'html', includeMe
   // Recovered messages may be partial or from another conversation, so they never advance a checkpoint.
   const history = kept ? { ...kept.history, messages } : { messages, reason: 'recovery', warning: '' };
   retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true,
-    media: kept?.media, partsDone: kept?.partsDone || 0, partDownloads: kept?.partDownloads || [], segmentJob: kept?.segmentJob };
+    media: kept?.media, partIds: kept?.partIds || [], segmentJob: kept?.segmentJob };
   return runExport({ format, includeMedia, loadAll: true });
 }
 

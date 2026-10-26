@@ -241,6 +241,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
+  if (msg.action === 'downloadStates') {
+    const ids = (msg.ids || []).filter(Number.isInteger);
+    Promise.all(ids.map(async id => [id, (await chrome.downloads.search({ id }))[0]?.state || 'missing']))
+      .then(entries => sendResponse({ states: Object.fromEntries(entries) }), () => sendResponse({ states: {} }));
+    return true;
+  }
+
   if (msg.action === 'discardStagedPackage') {
     stagedPackages.delete(mediaRequestKey(sender, msg.stageId));
     sendResponse({ success: true });

@@ -7,10 +7,11 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 // Reassembles staged export chunks the way the background does, then hands the payload to onPackage.
-function packageRecorder(onPackage, tabId = 1) {
+function packageRecorder(onPackage, tabId = 1, downloadState = () => 'complete') {
   const staged = { messages: [], mediaFiles: [] };
   return async msg => {
     if (msg.action === 'getTabId') return { tabId };
+    if (msg.action === 'downloadStates') return { states: Object.fromEntries(msg.ids.map(id => [id, downloadState(id)])) };
     if (msg.action === 'stagePackageParts') {
       staged.messages.push(...(msg.messages || []));
       staged.mediaFiles.push(...(msg.mediaFiles || []));
@@ -652,6 +653,30 @@ test('the checkpoint waits for every ZIP part, and the console export resumes at
   assert.equal(await c.gceExportFromMemory(), 'done');
   assert.deepEqual(parts, [0, 1, 2], 'parts saved before the failure are not repeated');
   assert.deepEqual(Array.from(lastPayload.partDownloads), [100, 101], 'the last part carries the earlier parts\' downloads');
+});
+
+test('a retry packages an earlier ZIP part again when its download did not complete', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', c);
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b', 'c'].map(n => ({ text: n, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'x'.repeat(6), mimeType: 'image/png' });
+  const parts = [];
+  let failAt = 2;
+  let nextId = 100;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    if (payload.part.index === failAt) return { success: false, error: 'killed' };
+    parts.push(payload.part.index);
+    return { success: true, filename: `p${payload.part.index + 1}.zip`, downloadIds: [nextId++] };
+  }, 1, id => id === 100 ? 'interrupted' : 'complete');
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  failAt = -1;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.deepEqual(parts, [0, 1, 0, 2], 'the interrupted part 1 is rebuilt, the completed part 2 is not');
 });
 
 test('a text retry after a failed HTML export keeps the kept messages linked to the kept media', async () => {
