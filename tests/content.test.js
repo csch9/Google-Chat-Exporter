@@ -846,6 +846,14 @@ test('a resumed page finds the linked message by either ID, backs up stored segm
   assert.equal(await other.c.runExport({ format: 'txt' }), 'done');
   assert.equal(other.sent.scans, 2, 'the other conversation was scanned');
   assert.ok(Object.keys(store).length, 'the failed run\'s segments are kept');
+
+  // Another conversation opened while Chat rendered: the job is left as it was.
+  await hop();
+  const switched = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' } });
+  switched.c.sleep = async () => { switched.c.location = { href: 'https://chat.google.com/app/chat/OTHER' }; };
+  assert.equal(await switched.c.resumeSegmentJob(), undefined);
+  assert.equal(switched.sent.scans, 0);
+  assert.equal(store['gceSegmentJob:1'].state, 'hop', 'the job stays recoverable');
 });
 
 test('segmented scans in two tabs keep separate jobs and segments', async () => {

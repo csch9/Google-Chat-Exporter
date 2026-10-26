@@ -1464,7 +1464,8 @@ async function hopToNextSegment(job, messages, target, options, retries = 0) {
 async function resumeSegmentJob() {
   const job = await readSegmentJob();
   if (!job || job.state !== 'hop' || Date.now() - job.at > SEGMENT_HOP_MAX_AGE_MS) return;
-  if (!(topFrameUrl() || location.href).includes(job.conversation)) return;
+  const onJobConversation = () => (topFrameUrl() || location.href).includes(job.conversation);
+  if (!onJobConversation()) return;
   for (let i = 0; i < 60 && !document.querySelector(SEL.messageGroups); i++) await sleep(500);
   if (!document.querySelector(SEL.messageGroups) || exportInProgress) return;
   // Let Chat finish positioning on the linked message: wait until the rendered list stops growing.
@@ -1475,6 +1476,9 @@ async function resumeSegmentJob() {
     stable = now === groups ? stable + 1 : 0;
     groups = now;
   }
+  // Another conversation may have been opened while Chat rendered; leave the job untouched for recovery.
+  const current = await readSegmentJob();
+  if (!onJobConversation() || current?.id !== job.id || current.state !== 'hop' || exportInProgress) return;
   await writeSegmentJob({ ...job, state: 'running' });
   // Some workspaces do not open message links; scanning from wherever Chat landed would loop, so export what is stored.
   if (job.message && !document.querySelector(`[${SEL.attrs.groupId}="${job.message}"], [data-message-id="${job.message}"]`)) {
