@@ -30,7 +30,8 @@
       font-size: 13px;
       color: var(--text);
       background: var(--surface);
-      overflow: hidden;
+      /* Hiding only horizontal overflow lets the popup scroll once Advanced Scan Options is expanded. */
+      overflow-x: hidden;
       -webkit-font-smoothing: antialiased;
     }
 
@@ -287,6 +288,24 @@
     }
     .tip-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
 
+    /* ── Advanced scan options ── */
+    .advanced > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 14px;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .advanced > summary::-webkit-details-marker { display: none; }
+    .advanced > summary::after { content: '▸'; margin-left: auto; color: var(--text-3); transition: transform .15s; }
+    .advanced[open] > summary::after { transform: rotate(90deg); }
+    .advanced[open] > summary { border-bottom: 1px solid var(--border); }
+    .option-warn { font-size: 11px; color: #b06000; margin-top: 3px; font-weight: 500; }
+
     /* ── Footer ── */
     .footer {
       padding: 10px 20px 14px;
@@ -332,7 +351,7 @@
         <h1>Google Chat Exporter</h1>
         <p>Export your conversations locally &amp; privately</p>
       </div>
-      <span class="version-badge">v2.2.0</span>
+      <span class="version-badge">v3.0.0</span>
     </div>
   </div>
 
@@ -366,7 +385,7 @@
           <div class="option-sub">Scroll up to load all messages</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="load-all" checked>
+          <input type="checkbox" id="load-all" aria-label="Load Full History" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -387,7 +406,7 @@
           <div class="option-sub">First run establishes a baseline. Saves a new file.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="incremental">
+          <input type="checkbox" id="incremental" aria-label="New Since Last Export">
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -400,7 +419,7 @@
           <div class="option-sub">Download images, audio, files</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="include-media" checked>
+          <input type="checkbox" id="include-media" aria-label="Include Media" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -415,12 +434,103 @@
           <div class="option-sub">Exports each channel you open. Ends after 10 min without a switch.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="export-mode">
+          <input type="checkbox" id="export-mode" aria-label="Auto-Export on Open">
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
       </div>
     </div>
+
+    <details class="option-group advanced" id="advanced">
+      <summary><span class="option-icon">⚙️</span>Advanced Scan Options</summary>
+
+      <div class="option-row">
+        <div class="option-label">
+          Free Memory While Scanning
+          <div class="option-sub">Temporarily removes collected messages from the page to keep long scans fast. Restored when done.</div>
+          <div class="option-warn">⚠️ The chat may look garbled during and after the export; reload the tab when it finishes.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-prune-dom" aria-label="Free Memory While Scanning" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Segmented Scanning
+          <div class="option-sub">Every few thousand messages, reopens Chat at the oldest message to stay fast. Needs message links to work in your workspace.</div>
+          <div class="option-warn">⚠️ The tab navigates on its own and ends at an old message; reload the chat when the export finishes.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-segmented-scan" aria-label="Segmented Scanning" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row" id="segment-size-row">
+        <div class="option-label">
+          Segment Size
+          <div class="option-sub">Messages per segment. Use a smaller size on computers with less memory.</div>
+        </div>
+        <select class="format-select" id="opt-segment-size" aria-label="Messages per segment">
+          <option value="2000">2000</option>
+          <option value="3000">3000</option>
+          <option value="4000" selected>4000</option>
+          <option value="5000">5000</option>
+        </select>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Nudge History Loading
+          <div class="option-sub">Sends a scroll-up event as soon as the top is reached, so Chat loads older messages sooner.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-history-nudge" aria-label="Nudge History Loading" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Reuse Scan After a Failure
+          <div class="option-sub">A failed export keeps its messages and media; exporting again skips the rescan.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-retry-reuse" aria-label="Reuse Scan After a Failure" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Save Scan Backup
+          <div class="option-sub">Downloads one zipped JSON copy of scans with 1000+ messages when the export ends, whether it finished, failed or was cancelled.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-scan-backup" aria-label="Save Scan Backup" checked>
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+
+      <div class="option-row">
+        <div class="option-label">
+          Diagnostic Logging
+          <div class="option-sub">Logs scan timing, load latency and memory to the page console.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-diagnostics" aria-label="Diagnostic Logging">
+          <div class="toggle-track"></div>
+          <div class="toggle-thumb"></div>
+        </label>
+      </div>
+    </details>
 
     <!-- Export button -->
     <button class="export-btn" id="export-btn">
@@ -451,8 +561,8 @@
 
   <!-- Footer -->
   <div class="footer">
-    Crafted with <span class="heart">♥</span> by <a href="https://vishwas.me" target="_blank">Vishwas R</a>
-    &nbsp;·&nbsp; 100% private &amp; open source
+    Crafted with <span class="heart">♥</span> by <a href="https://vishwas.me" target="_blank">Vishwas R</a> &amp; <a href="https://github.com/csch9/Google-Chat-Exporter" target="_blank">csch9</a><br>
+    100% private &amp; open source
   </div>
 
   <script src="popup.js"></script>

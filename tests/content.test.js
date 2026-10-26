@@ -6,6 +6,25 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
+// Reassembles staged export chunks the way the background does, then hands the payload to onPackage.
+function packageRecorder(onPackage, tabId = 1, downloadState = () => 'complete') {
+  const staged = { messages: [], mediaFiles: [] };
+  return async msg => {
+    if (msg.action === 'getTabId') return { tabId };
+    if (msg.action === 'downloadStates') return { states: Object.fromEntries(msg.ids.map(id => [id, downloadState(id)])) };
+    if (msg.action === 'stagePackageParts') {
+      staged.messages.push(...(msg.messages || []));
+      staged.mediaFiles.push(...(msg.mediaFiles || []));
+      return { success: true };
+    }
+    if (msg.action !== 'packageAndDownload') return {};
+    return onPackage({ ...msg.payload, messages: staged.messages.splice(0), mediaFiles: staged.mediaFiles.splice(0) });
+  };
+}
+
+// Lets the content script's startup (which may resume a segmented scan) finish before a test swaps in shared storage.
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
 function loadContent() {
   const event = { addListener() {} };
   const selectors = {
@@ -25,7 +44,7 @@ function loadContent() {
     runtime: {
       getURL(value) { return value; },
       onMessage: event,
-      async sendMessage() { return {}; },
+      async sendMessage(msg) { return msg?.action === 'getTabId' ? { tabId: 1 } : {}; },
       lastError: null
     }
   };
@@ -84,6 +103,12 @@ test('already-aborted work fails before it starts', () => {
 test('virtualized history visits overlapping windows, deduplicates, and completes at idle', async () => {
   const c = loadContent();
   await c.loadSelectors();
+  // A virtualized list mutates the DOM on every scroll step.
+  c.MutationObserver = class {
+    observe() {}
+    disconnect() {}
+    takeRecords() { return [{ target: { nodeType: 1, closest: () => null } }]; }
+  };
   const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
     getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
   c.findScrollContainer = () => container;
@@ -95,30 +120,150 @@ test('virtualized history visits overlapping windows, deduplicates, and complete
   const waits = [];
   c.waitForHistoryMutation = async (_el, _height, _oldest, timeout) => { waits.push(timeout); };
   c.sleep = async () => {};
+  c.provokeHistoryLoad = async () => false;
   const result = await c.scrollToLoadAll();
   assert.deepEqual(Array.from(result.messages, m => m.text), Array.from({ length: 12 }, (_, i) => String(i)));
   assert.equal(result.reason, 'idle');
   assert.equal(result.warning, '');
-  assert.deepEqual(waits.slice(-3), [600, 1200, 1800], 'final idle checks total 3.6 seconds');
+  assert.deepEqual(waits.slice(-8), [600, 1200, 1800, 2400, 3000, 3600, 4000, 4000], 'final idle checks back off to a 4 second cap');
   assert.equal(container.scrollTop, 800);
 });
 
-test('cancel during history restores position and disconnects its observer', async () => {
+test('stalled top nudges the scroll position and unchanged DOM is not re-collected', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 0,
+    getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+  c.findScrollContainer = () => container;
+  let extractions = 0;
+  c.extractMessages = () => { extractions++; return [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }]; };
+  c.getOldestTimestamp = () => 1;
+  c.waitForHistoryMutation = async () => {};
+  c.sleep = async () => {};
+  const tops = [];
+  let top = 0;
+  Object.defineProperty(container, 'scrollTop', { get: () => top, set: value => { tops.push(value); top = value; } });
+  const result = await c.scrollToLoadAll();
+  assert.equal(result.reason, 'idle');
+  assert.ok(tops.includes(100), 'first retries nudge the scroll position');
+  assert.ok(tops.includes(1200), 'later retries move away and walk back up to the top');
+  assert.equal(extractions, 2, 'only the initial and final collections scan an unchanged DOM');
+});
+
+test('large exports are staged in bounded chunks and discarded on failure', async () => {
+  const c = loadContent();
+  const sent = [];
+  c.chrome.runtime.sendMessage = async msg => { sent.push(msg); return msg.action === 'packageAndDownload' ? { success: false } : { success: true }; };
+  const messages = Array.from({ length: 1200 }, (_, i) => ({ text: String(i) }));
+  const mediaFiles = Array.from({ length: 3 }, (_, i) => ({ path: `m${i}`, base64: 'x'.repeat(10_000_000) }));
+  await c.sendPackage('html', { conversationName: 'x', messages, mediaFiles, history: {} });
+  const parts = sent.filter(m => m.action === 'stagePackageParts');
+  assert.deepEqual(parts.filter(m => m.messages).map(m => m.messages.length), [500, 500, 200]);
+  assert.deepEqual(parts.filter(m => m.mediaFiles).map(m => m.mediaFiles.length), [2, 1]);
+  const final = sent.at(-1);
+  assert.equal(final.action, 'packageAndDownload');
+  assert.equal(final.payload.messages, undefined, 'bulk data never rides on the final message');
+  sent.length = 0;
+  c.chrome.runtime.sendMessage = async msg => {
+    sent.push(msg.action);
+    if (msg.messages) throw new Error('boom');
+    return {};
+  };
+  await assert.rejects(c.sendPackage('txt', { messages: [{ text: 'a' }], mediaFiles: [], history: {} }), /boom/);
+  assert.deepEqual(sent, ['stagePackageParts', 'discardStagedPackage']);
+});
+
+test('stopping the history scan keeps collected messages, restores position and disconnects its observer', async () => {
   const c = loadContent();
   await c.loadSelectors();
   let disconnected = false;
-  c.MutationObserver = class { observe() {} disconnect() { disconnected = true; } };
+  c.MutationObserver = class { observe() {} disconnect() { disconnected = true; } takeRecords() { return []; } };
   const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
     getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
   c.findScrollContainer = () => container;
-  c.extractMessages = () => [];
+  c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
   c.getOldestTimestamp = () => 1;
   const controller = new AbortController();
   const pending = c.scrollToLoadAll(null, 0, controller.signal);
   controller.abort();
-  await assert.rejects(pending, { name: 'AbortError' });
+  const result = await pending;
+  assert.equal(result.reason, 'stopped');
+  assert.match(result.warning, /stopped early/);
+  assert.deepEqual(Array.from(result.messages, m => m.text), ['a']);
   assert.equal(container.scrollTop, 800);
   assert.ok(disconnected);
+});
+
+test('first cancel during the scan exports collected messages without advancing the checkpoint', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async (_ms, signal) => c.throwIfAborted(signal);
+  let scanSignal;
+  c.scrollToLoadAll = (_progress, _cutoff, signal) => new Promise(resolve => {
+    scanSignal = signal;
+    signal.addEventListener('abort', () => resolve({ messages: [{ text: 'kept' }], reason: 'stopped', warning: 'stopped early' }));
+  });
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  const run = c.runExport({ format: 'txt' });
+  for (let i = 0; i < 30 && !scanSignal; i++) await Promise.resolve();
+  vm.runInContext('historyScanStop.abort()', c);
+  assert.equal(await run, 'done');
+  assert.deepEqual(Array.from(packaged.messages, m => m.text), ['kept']);
+  assert.equal(packaged.history.reason, 'stopped');
+  assert.equal(packaged.checkpoint, null);
+});
+
+test('collected history far below the viewport is detached by outermost wrapper and restored in place', async () => {
+  const c = loadContent();
+  const sel = await c.loadSelectors();
+  sel.dateSeparator = '.sep';
+  sel.messageGroups = '.group';
+  // Minimal DOM: container > list > (row > group | separator); enough for the pruner's node operations.
+  const container = { clientHeight: 400, getBoundingClientRect: () => ({ bottom: 400 }) };
+  const node = (name, top = 0, parent = null) => {
+    const n = {
+      name, top, parent, children: [], textContent: name === 'sep' ? 'Monday' : '',
+      get parentElement() { return this.parent; },
+      matches: sel => sel === '.sep' && name === 'sep',
+      getBoundingClientRect: () => ({ top }),
+      get isConnected() { return !!this.parent && (this.parent === container || this.parent.isConnected); },
+      get nextSibling() { return this.parent?.children ? this.parent.children[this.parent.children.indexOf(this) + 1] || null : null; },
+      remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; },
+      appendChild(child) { child.remove(); child.parent = this; this.children.push(child); },
+      replaceWith(other) {
+        const list = this.parent.children;
+        const incoming = other.name === '#fragment' ? other.children.splice(0) : (other.remove(), [other]);
+        incoming.forEach(x => { x.parent = this.parent; });
+        list.splice(list.indexOf(this), 1, ...incoming);
+        this.parent = null;
+      }
+    };
+    if (parent) parent.children.push(n);
+    return n;
+  };
+  const list = node('list', 0, null);
+  list.parent = container;
+  const row = (name, top) => { const r = node(`row-${name}`, top, list); node(name, top, r); return r; };
+  row('g0', 100); row('g1', 500); row('g2', 2500); node('sep', 2900, list); row('g3', 3000); row('g4', 4000);
+  const original = list.children.map(n => n.name);
+  container.querySelectorAll = () => list.children.filter(n => n.name !== '#comment')
+    .map(n => n.name === 'sep' ? n : n.children[0]);
+  c.document.createComment = () => node('#comment');
+  c.document.createDocumentFragment = () => node('#fragment');
+  const pruner = c.createHistoryPruner(container);
+  assert.equal(pruner.prune(), 3, 'counts message groups only');
+  assert.deepEqual(list.children.map(n => n.name), ['row-g0', 'row-g1', '#comment'],
+    'wrappers and separators below the buffer go behind one marker');
+  assert.equal(pruner.leadingDate, 'Monday');
+  assert.equal(pruner.prune(), 0, 'buffer content stays attached');
+  assert.equal(pruner.count, 3);
+  assert.equal(pruner.restore(), 0);
+  assert.deepEqual(list.children.map(n => n.name), original);
+  assert.equal(pruner.count, 0);
 });
 
 test('anchor restoration handles prepended content and changed layout', async () => {
@@ -359,11 +504,11 @@ test('incremental web-app export falls back to a content-derived checkpoint', as
   const stored = {};
   c.chrome.storage.local.get = async key => ({ [key]: stored[key] });
   let downloads = 0;
-  c.chrome.runtime.sendMessage = async msg => {
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
     downloads++;
-    stored[msg.payload.checkpoint.key] = msg.payload.checkpoint.value;
+    stored[payload.checkpoint.key] = payload.checkpoint.value;
     return { success: true, filename: 'pwa.txt' };
-  };
+  });
   const options = { format: 'txt', incremental: true, sourceUrl: 'https://chat.google.com/u/0/' };
   await c.runExport(options);
   await c.runExport(options);
@@ -387,11 +532,11 @@ test('incremental export establishes baseline, exports new files, then reports n
   const stored = {};
   c.chrome.storage.local.get = async key => ({ [key]: stored[key] });
   const packages = [];
-  c.chrome.runtime.sendMessage = async msg => {
-    packages.push(msg.payload);
-    if (msg.payload.checkpoint) stored[msg.payload.checkpoint.key] = msg.payload.checkpoint.value;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    packages.push(payload);
+    if (payload.checkpoint) stored[payload.checkpoint.key] = payload.checkpoint.value;
     return { success: true, filename: 'fixture.zip' };
-  };
+  });
   c.downloadMedia = async () => ({ success: true, base64: 'eA==', mimeType: 'text/plain' });
   const options = { format: 'html', includeMedia: true, incremental: true, sourceUrl: 'https://chat.google.com/u/0/app/chat/ABC' };
   await c.runExport(options);
@@ -414,6 +559,888 @@ test('incremental export establishes baseline, exports new files, then reports n
   await c.runExport({ ...options, format: 'txt' });
   assert.equal(packages[3].messages.length, 3, 'TXT starts its own baseline rather than inheriting the media checkpoint');
   assert.equal(Object.keys(stored).length, 2);
+});
+
+test('a failed export keeps its scan so the retry skips rescanning', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let scans = 0;
+  c.scrollToLoadAll = async () => { scans++; return { messages: [{ text: 'kept' }], reason: 'idle', warning: '' }; };
+  let fail = true;
+  c.chrome.runtime.sendMessage = packageRecorder(() => fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' });
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 1, 'retry reused the retained scan');
+  await c.runExport({ format: 'txt' });
+  assert.equal(scans, 2, 'a successful export clears the retained scan');
+});
+
+test('a failed HTML export keeps downloaded media for the retry', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.scrollToLoadAll = async () => ({ messages: [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png' }] }], reason: 'idle', warning: '' });
+  let downloads = 0;
+  c.downloadMedia = async () => { downloads++; return { success: true, base64: 'eA==', mimeType: 'image/png' }; };
+  let fail = true;
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'Invalid string length' } : { success: true, filename: 'x.zip' }; });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.equal(downloads, 1, 'media is not downloaded again');
+  assert.equal(packaged.mediaFiles.length, 1);
+  assert.equal(packaged.messages[0].media[0]._localPath, packaged.mediaFiles[0].path);
+});
+
+test('HTML media is packaged one part per request and a failed part resumes without repeating earlier ones', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', c);
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b', 'c'].map(n => ({ text: n, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'x'.repeat(6), mimeType: 'image/png' });
+  const parts = [];
+  let failAt = 1;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    if (payload.part.index === failAt) return { success: false, error: 'killed' };
+    parts.push({ index: payload.part.index, count: payload.part.count, messages: payload.messages.length, media: payload.mediaFiles.length });
+    return { success: true, filename: `p${payload.part.index + 1}.zip` };
+  });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  failAt = -1;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.deepEqual(parts, [
+    { index: 0, count: 3, messages: 3, media: 1 },
+    { index: 1, count: 3, messages: 0, media: 1 },
+    { index: 2, count: 3, messages: 0, media: 1 }
+  ], 'index.html travels only with part 1, and part 1 is not repeated on retry');
+});
+
+test('the checkpoint waits for every ZIP part, and the console export resumes at the failed part', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', c);
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b', 'c'].map((n, i) => ({ text: n, absoluteTimestamp: i + 1, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'x'.repeat(6), mimeType: 'image/png' });
+  const parts = [];
+  let failAt = 1;
+  let lastPayload;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    if (payload.part.index === failAt) return { success: false, error: 'killed' };
+    parts.push(payload.part.index);
+    lastPayload = payload;
+    return { success: true, filename: `p${payload.part.index + 1}.zip`, downloadIds: [100 + payload.part.index] };
+  });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  failAt = -1;
+  assert.equal(await c.gceExportFromMemory(), 'done');
+  assert.deepEqual(parts, [0, 1, 2], 'parts saved before the failure are not repeated');
+  assert.deepEqual(Array.from(lastPayload.partDownloads), [100, 101], 'the last part carries the earlier parts\' downloads');
+});
+
+test('a retry packages an earlier ZIP part again when its download did not complete', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', c);
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b', 'c'].map(n => ({ text: n, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'x'.repeat(6), mimeType: 'image/png' });
+  const parts = [];
+  let failAt = 2;
+  let nextId = 100;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => {
+    if (payload.part.index === failAt) return { success: false, error: 'killed' };
+    parts.push(payload.part.index);
+    return { success: true, filename: `p${payload.part.index + 1}.zip`, downloadIds: [nextId++] };
+  }, 1, id => id === 100 ? 'interrupted' : 'complete');
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  failAt = -1;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.deepEqual(parts, [0, 1, 0, 2], 'the interrupted part 1 is rebuilt, the completed part 2 is not');
+});
+
+test('a text retry after a failed HTML export keeps the kept messages linked to the kept media', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.scrollToLoadAll = async () => ({ messages: [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png' }] }], reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'eA==', mimeType: 'image/png' });
+  let fail = true;
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x' }; });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  assert.equal(packaged.messages[0].media[0]._localPath, undefined, 'the text export has no packaged paths');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.equal(packaged.messages[0].media[0]._localPath, packaged.mediaFiles[0].path);
+});
+
+test('a kept scan is not reused once another conversation is open at the same address', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  let name = 'Alpha';
+  c.getConversationName = () => name;
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let scans = 0;
+  c.scrollToLoadAll = async () => { scans++; return { messages: [{ text: name }], reason: 'idle', warning: '' }; };
+  let fail = true;
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  fail = false;
+  name = 'Beta';
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 2, 'the other conversation is scanned');
+  assert.equal(packaged.messages[0].text, 'Beta');
+});
+
+test('long scans hop to a fresh page at the oldest message and the resumed page exports all segments', async () => {
+  const store = {};
+  const storage = {
+    async get(keys) {
+      if (keys == null) return { ...store };
+      return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+    },
+    async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+    async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+  };
+  const page = async (scan) => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = storage;
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => 'Fixture';
+    c.showProgress = () => {};
+    const backups = [];
+    c.saveScanBackup = messages => backups.push(Array.from(messages, m => m.text));
+    vm.runInContext('SCAN_BACKUP_MIN_MESSAGES = 1; SEGMENT_STALL_MESSAGES = 0', c);
+    c.sleep = async () => {};
+    c.location = { href: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1' };
+    c.document.querySelector = () => ({});
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/SPACE/topic/t1/message/t1', conversation: 'SPACE' });
+    c.scrollToLoadAll = async () => scan;
+    const sent = { navigations: [], packaged: null, backups };
+    const pack = packageRecorder(payload => {
+      sent.packaged = payload;
+      sent.storedAtPackaging = Object.keys(store).filter(k => k.startsWith('gceSegment:')).length;
+      return { success: true, filename: 'x.txt' };
+    });
+    c.chrome.runtime.sendMessage = async msg => {
+      if (msg.action === 'navigateTab') { sent.navigations.push(msg.url); return { success: true }; }
+      return pack(msg);
+    };
+    return { c, sent };
+  };
+  const msg = (key, ts) => ({ _dedupKey: key, text: key, absoluteTimestamp: ts });
+
+  const first = await page({ messages: [msg('b', 2), msg('c', 3)], reason: 'segment', warning: '' });
+  assert.equal(await first.c.runExport({ format: 'txt' }), 'segment');
+  assert.deepEqual(first.sent.navigations, ['https://chat.google.com/app/chat/SPACE/topic/t1/message/t1']);
+  assert.equal(store['gceSegmentJob:1'].state, 'hop');
+  assert.equal(first.sent.packaged, null, 'nothing is packaged before the last segment');
+  assert.deepEqual(first.sent.backups, [], 'no backup download while hopping between segments');
+
+  const second = await page({ messages: [msg('a', 1), msg('b', 2)], reason: 'idle', warning: '' });
+  assert.equal(await second.c.resumeSegmentJob(), 'done');
+  assert.deepEqual(Array.from(second.sent.packaged.messages, m => m.text), ['a', 'b', 'c'], 'segments merged without the overlap');
+  assert.equal(second.sent.storedAtPackaging, 2, 'the last segment is stored before packaging, so a crash cannot lose it');
+  assert.deepEqual(second.sent.backups, [['a', 'b', 'c']], 'one backup with every segment when the run ends');
+  assert.deepEqual(Object.keys(store), [], 'stored segments are cleared after a successful export');
+});
+
+test('a resumed page finds the linked message by either ID, backs up stored segments, and a retry clears the job', async () => {
+  const store = {};
+  const storage = {
+    async get(keys) {
+      if (keys == null) return { ...store };
+      return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+    },
+    async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+    async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+  };
+  const page = async ({ scan, onPage = () => true, fail = () => false }) => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = storage;
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => 'Fixture';
+    c.showProgress = () => {};
+    const sent = { backups: [], scans: 0, packaged: null };
+    c.saveScanBackup = messages => sent.backups.push(Array.from(messages, m => m.text));
+    vm.runInContext('SCAN_BACKUP_MIN_MESSAGES = 1; SEGMENT_STALL_MESSAGES = 0', c);
+    c.sleep = async () => {};
+    c.location = { href: 'https://chat.google.com/app/chat/SPACE/topic/m1/message/m1' };
+    c.document.querySelector = selector => (/="m1"/.test(selector) ? onPage(selector) : true) ? {} : null;
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/SPACE/topic/m1/message/m1', conversation: 'SPACE', message: 'm1' });
+    c.scrollToLoadAll = async () => { sent.scans++; return scan; };
+    const pack = packageRecorder(payload => { sent.packaged = payload; return fail() ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' }; });
+    c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? { success: true } : pack(msg);
+    return { c, sent };
+  };
+  const msg = (key, ts) => ({ _dedupKey: key, text: key, absoluteTimestamp: ts });
+  const hop = async () => assert.equal(await (await page({ scan: { messages: [msg('b', 2)], reason: 'segment', warning: '' } })).c.runExport({ format: 'txt' }), 'segment');
+
+  // The message is only found through data-message-id: the scan continues.
+  await hop();
+  const byMessageId = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' }, onPage: s => /data-message-id/.test(s) });
+  assert.equal(await byMessageId.c.resumeSegmentJob(), 'done');
+  assert.equal(byMessageId.sent.scans, 1);
+
+  // Chat did not open the link: the stored segments are exported and still backed up.
+  await hop();
+  const notOpened = await page({ scan: null, onPage: () => false });
+  assert.equal(await notOpened.c.resumeSegmentJob(), 'done');
+  assert.deepEqual(notOpened.sent.backups, [['b']]);
+  assert.deepEqual(Object.keys(store), []);
+
+  // Packaging fails on the last page; a plain retry clears the finished job and its segments.
+  await hop();
+  let failing = true;
+  const retry = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' }, fail: () => failing });
+  assert.equal(await retry.c.resumeSegmentJob(), 'error');
+  assert.ok(Object.keys(store).length, 'the segments survive the failure');
+  failing = false;
+  assert.equal(await retry.c.runExport({ format: 'txt' }), 'done');
+  assert.equal(retry.sent.scans, 1, 'the retry reused the kept scan');
+  assert.deepEqual(Object.keys(store), [], 'the retry cleared the job');
+
+  // Chat did not open the link and packaging failed: a plain retry still clears that job.
+  await hop();
+  failing = true;
+  const unopened = await page({ scan: null, onPage: () => false, fail: () => failing });
+  assert.equal(await unopened.c.resumeSegmentJob(), 'error');
+  failing = false;
+  assert.equal(await unopened.c.runExport({ format: 'txt' }), 'done');
+  assert.deepEqual(Object.keys(store), [], 'the retry cleared the job');
+
+  // A fresh export of another conversation leaves the failed run's segments for recovery.
+  await hop();
+  failing = true;
+  const other = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' }, fail: () => failing });
+  assert.equal(await other.c.resumeSegmentJob(), 'error');
+  failing = false;
+  other.c.location = { href: 'https://chat.google.com/app/chat/OTHER' };
+  assert.equal(await other.c.runExport({ format: 'txt' }), 'done');
+  assert.equal(other.sent.scans, 2, 'the other conversation was scanned');
+  assert.ok(Object.keys(store).length, 'the failed run\'s segments are kept');
+
+  // Another conversation opened while Chat rendered: the job is left as it was.
+  await hop();
+  const switched = await page({ scan: { messages: [msg('a', 1)], reason: 'idle', warning: '' } });
+  switched.c.sleep = async () => { switched.c.location = { href: 'https://chat.google.com/app/chat/OTHER' }; };
+  assert.equal(await switched.c.resumeSegmentJob(), undefined);
+  assert.equal(switched.sent.scans, 0);
+  assert.equal(store['gceSegmentJob:1'].state, 'hop', 'the job stays recoverable');
+});
+
+test('segmented scans in two tabs keep separate jobs and segments', async () => {
+  const store = {};
+  const tab = async tabId => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = {
+      async get(keys) {
+        if (keys == null) return { ...store };
+        return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+      },
+      async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+      async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+    };
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => `Tab ${tabId}`;
+    c.showProgress = () => {};
+    c.sleep = async () => {};
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/X/topic/m/message/m', conversation: 'X', message: 'm' });
+    c.scrollToLoadAll = async () => ({ messages: [{ _dedupKey: `t${tabId}`, text: `t${tabId}`, absoluteTimestamp: tabId }], reason: 'segment', warning: '' });
+    const pack = packageRecorder(() => ({ success: true }), tabId);
+    c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? { success: true } : pack(msg);
+    return c;
+  };
+  assert.equal(await (await tab(1)).runExport({ format: 'txt' }), 'segment');
+  assert.equal(await (await tab(2)).runExport({ format: 'txt' }), 'segment');
+  const one = store['gceSegmentJob:1'];
+  assert.ok(one && store['gceSegmentJob:2'], 'both jobs are kept');
+  assert.deepEqual(Array.from(store[`gceSegment:${one.id}:0`], m => m.text), ['t1'], 'tab 1 keeps its segment');
+});
+
+test('stored segment jobs stay recoverable: a new scan keeps the old job, a failed merge keeps the count, and recovery cleans up', async () => {
+  const store = {};
+  let failSegmentReads = false;
+  const setup = async () => {
+    const c = loadContent();
+    await c.loadSelectors();
+    await settle();
+    c.chrome.storage.local = {
+      async get(keys) {
+        if (keys == null) return { ...store };
+        if (failSegmentReads && Array.isArray(keys)) throw new Error('storage unavailable');
+        return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]]));
+      },
+      async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+      async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+    };
+    c.isInChatFrame = () => true;
+    c.getConversationName = () => 'Fixture';
+    c.showProgress = () => {};
+    c.saveScanBackup = () => {};
+    vm.runInContext('SEGMENT_STALL_MESSAGES = 0', c);
+    c.sleep = async () => {};
+    c.location = { href: 'https://chat.google.com/app/chat/B' };
+    c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/B/topic/m/message/m', conversation: 'B', message: 'm' });
+    const pack = packageRecorder(() => ({ success: true, filename: 'x.txt' }));
+    c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? { success: true } : pack(msg);
+    return c;
+  };
+  const msg = text => ({ _dedupKey: text, text, absoluteTimestamp: 1 });
+
+  // A's export failed earlier; B's scan in the same tab reaches its first segment boundary.
+  Object.assign(store, { 'gceSegmentJob:1': { id: 'a', segments: 1, name: 'A', state: 'finished', at: Date.now() }, 'gceSegment:a:0': [msg('a')] });
+  const b = await setup();
+  b.scrollToLoadAll = async () => ({ messages: [msg('b')], reason: 'segment', warning: '' });
+  assert.equal(await b.runExport({ format: 'txt' }), 'segment');
+  assert.equal(store['gceSegmentJob:recovery:a']?.name, 'A', 'A\'s job moved to a recovery key');
+  assert.deepEqual(Array.from(store['gceSegment:a:0'], m => m.text), ['a']);
+
+  // Reading the segments fails after B's last page: the stored job already counts that page.
+  const last = await setup();
+  last.scrollToLoadAll = async () => ({ messages: [msg('b0')], reason: 'idle', warning: '' });
+  failSegmentReads = true;
+  assert.equal(await last.runExport({ format: 'txt', segmentJob: store['gceSegmentJob:1'] }), 'error');
+  failSegmentReads = false;
+  assert.equal(store['gceSegmentJob:1'].segments, 2);
+  assert.ok(store[`gceSegment:${store['gceSegmentJob:1'].id}:1`], 'the last page is stored');
+
+  // A console export of this tab's stored job clears it; a recent job still running in another tab is left alone.
+  store['gceSegmentJob:7'] = { id: 'r', segments: 1, name: 'Running', state: 'running', at: Date.now() + 1 };
+  store['gceSegment:r:0'] = [msg('r')];
+  const recover = await setup();
+  assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(store['gceSegmentJob:1'], undefined, 'the recovered job is cleared');
+  vm.runInContext('retainedScan = null', recover);
+  await recover.chrome.storage.local.remove('gceSegmentJob:recovery:a');
+  assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.ok(store['gceSegmentJob:7'] && store['gceSegment:r:0'], 'the other tab\'s running job is kept');
+
+  // That tab stopped refreshing its job long ago (closed or crashed): recovery clears it.
+  store['gceSegmentJob:7'] = { ...store['gceSegmentJob:7'], at: Date.now() - 20 * 60000, alive: Date.now() - 6 * 60000 };
+  vm.runInContext('retainedScan = null', recover);
+  assert.equal(await recover.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(store['gceSegmentJob:7'], undefined, 'the abandoned job is cleared');
+  assert.equal(store['gceSegment:r:0'], undefined);
+
+  // A scanning page keeps its job marked as alive.
+  const live = await setup();
+  live.setInterval = setInterval;
+  live.clearInterval = clearInterval;
+  vm.runInContext('SEGMENT_HEARTBEAT_MS = 1', live);
+  store['gceSegmentJob:1'] = { id: 'l', segments: 1, state: 'running', at: 0 };
+  let aliveDuringScan = 0;
+  live.scrollToLoadAll = async () => {
+    await new Promise(resolve => setTimeout(resolve, 30));
+    aliveDuringScan = store['gceSegmentJob:1']?.alive || 0;
+    return { messages: [msg('l')], reason: 'idle', warning: '' };
+  };
+  assert.equal(await live.runExport({ format: 'txt', segmentJob: { ...store['gceSegmentJob:1'] } }), 'done');
+  assert.ok(aliveDuringScan > 0, 'the job was refreshed while scanning');
+});
+
+test('oldest-message link follows the app URL, falling back to the copied-link format', async () => {
+  const c = loadContent();
+  const sel = await c.loadSelectors();
+  sel.attrs.groupId = 'data-id';
+  const attrs = { 'data-id': 'dV5wI_76Cgs', 'data-topic-id': 'dV5wI_76Cgs', 'data-group-synthetic-id': 'space/AAAAtnkdPQo' };
+  const inner = { getAttribute: name => attrs[name] ?? null };
+  const group = { getAttribute: name => name === 'data-id' ? attrs['data-id'] : null, closest: () => null,
+    querySelector: sel => (sel.slice(1, -1) in attrs ? inner : null) };
+  c.document.querySelector = () => group;
+  c.location = { href: 'https://chat.google.com/app/chat/AAAAtnkdPQo' };
+  assert.deepEqual({ ...c.oldestMessageLink() }, {
+    link: 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
+  c.location = { href: 'https://mail.google.com/chat/u/0/#chat/space/AAAAtnkdPQo' };
+  assert.deepEqual({ ...c.oldestMessageLink() }, {
+    link: 'https://chat.google.com/u/0/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
+  c.location = { href: 'https://mail.google.com/chat/#chat/space/AAAAtnkdPQo' };
+  assert.equal(c.oldestMessageLink().link, 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs');
+  c.location = { href: 'https://chat.google.com/app/chat/AAAAtnkdPQo?authuser=2' };
+  assert.equal(c.oldestMessageLink().link, 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs?authuser=2', 'the account survives the reopen');
+  c.location = { href: 'https://chat.google.com/u/1/app/chat/AAAAtnkdPQo' };
+  assert.equal(c.oldestMessageLink().link, 'https://chat.google.com/u/1/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs');
+});
+
+test('console backup saves the kept scan and a picked backup file is exported', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.getConversationName = () => 'Fixture';
+  const saved = [];
+  c.saveScanBackup = (messages, name) => saved.push({ count: messages.length, name });
+  vm.runInContext("retainedScan = { url: '', dateFromTs: 0, at: 0, history: { messages: [{ text: 'a' }, { text: 'b' }] } }", c);
+  assert.equal(await c.gceSaveBackup(), '2 messages from retained scan');
+  assert.deepEqual(saved, [{ count: 2, name: 'Fixture' }]);
+
+  let input;
+  c.document.createElement = () => (input = { click() {}, files: [{ text: async () => JSON.stringify([{ text: 'x' }]) }] });
+  const exported = [];
+  c.gceExportFromMemory = async (messages, options) => { exported.push({ messages, options }); return 'done'; };
+  const pending = c.gceExportBackupFile({ format: 'txt' });
+  await input.onchange();
+  assert.equal(await pending, 'done');
+  assert.deepEqual(Array.from(exported[0].messages, m => m.text), ['x']);
+  assert.equal(exported[0].options.format, 'txt');
+});
+
+test('scan backups are zipped when JSZip is loaded, and zipped backups can be exported', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  const zipped = [];
+  c.JSZip = class {
+    file(name, data) { zipped.push({ name, data }); return this; }
+    async generateAsync() { return 'ZIP'; }
+    static async loadAsync() {
+      return { files: { 'dir/': { dir: true, name: 'dir/' }, 'b.json': { dir: false, name: 'b.json', async: async () => '[{"text":"z"}]' } } };
+    }
+  };
+  c.URL = { createObjectURL: blob => `blob:${blob}`, revokeObjectURL() {} };
+  const anchors = [];
+  c.document.documentElement = { appendChild() {} };
+  c.document.createElement = () => { const a = { click() {}, remove() {} }; anchors.push(a); return a; };
+  await c.saveScanBackup([{ text: 'a' }], 'My Chat');
+  assert.match(anchors[0].download, /^My_Chat_scan-backup_.*\.zip$/);
+  assert.equal(anchors[0].href, 'blob:ZIP');
+  assert.match(zipped[0].name, /\.json$/);
+  assert.equal(zipped[0].data, '[{"text":"a"}]');
+
+  let input;
+  c.document.createElement = () => (input = { click() {}, files: [{ name: 'backup.zip' }] });
+  let exported;
+  c.gceExportFromMemory = async messages => { exported = messages; return 'done'; };
+  const pending = c.gceExportBackupFile();
+  await input.onchange();
+  assert.equal(await pending, 'done');
+  assert.deepEqual(Array.from(exported, m => m.text), ['z']);
+});
+
+test('a reopened segment that stalls is reopened elsewhere, then exported with a warning once retries run out', async () => {
+  const store = {};
+  const c = loadContent();
+  await c.loadSelectors();
+  c.chrome.storage.local = {
+    async get(keys) { return Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]])); },
+    async set(values) { Object.assign(store, JSON.parse(JSON.stringify(values))); },
+    async remove(keys) { [].concat(keys).forEach(k => delete store[k]); }
+  };
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.saveScanBackup = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/DM/topic/m1/message/m1' };
+  c.oldestMessageLink = () => ({ link: 'https://chat.google.com/app/chat/DM/topic/m0/message/m0', conversation: 'DM', message: 'm0' });
+  const stalled = { messages: [{ _dedupKey: 'x', text: 'x', absoluteTimestamp: Date.UTC(2024, 0, 2) }], startCount: 1, reason: 'idle', warning: '' };
+  c.scrollToLoadAll = async () => ({ ...stalled });
+  const navigations = [];
+  let packaged = null;
+  const pack = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  c.chrome.runtime.sendMessage = async msg => msg.action === 'navigateTab' ? (navigations.push(msg.url), { success: true }) : pack(msg);
+  const job = { id: 'j', segments: 1, collected: 3000, options: { format: 'txt' }, retries: 0, startedAt: Date.now() - 60000 };
+  store[`gceSegment:j:0`] = [{ _dedupKey: 'y', text: 'y', absoluteTimestamp: Date.UTC(2024, 5, 1) }];
+
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'segment');
+  assert.equal(navigations.length, 1);
+  assert.equal(store['gceSegmentJob:1'].retries, 1);
+
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: { ...store['gceSegmentJob:1'], retries: 10 } }), 'done');
+  assert.equal(navigations.length, 1, 'no further reopen once retries run out');
+  assert.match(packaged.history.warning, /may be incomplete.*after 10 reopen attempts/);
+  assert.equal(packaged.history.reason, 'stalled');
+  assert.deepEqual(Array.from(packaged.messages, m => m.text), ['x', 'y']);
+
+  // The visible "created this chat" line means the real start was reached: no reopen, no warning.
+  c.conversationStartVisible = () => true;
+  store['gceSegmentJob:1'] = job;
+  assert.equal(await c.runExport({ format: 'txt', segmentJob: job }), 'done');
+  assert.equal(navigations.length, 1);
+  assert.equal(packaged.history.reason, 'idle');
+  assert.equal(packaged.history.warning, '');
+  assert.ok(packaged.stats.exportSeconds >= packaged.stats.scan.seconds, 'total time covers every segment');
+});
+
+test('a reopened page that barely loads anything gives up after fewer idle checks', async () => {
+  const run = async quickStall => {
+    const c = loadContent();
+    await c.loadSelectors();
+    const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 0,
+      getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+    c.findScrollContainer = () => container;
+    c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
+    c.getOldestTimestamp = () => 1;
+    c.sleep = async () => {};
+    c.provokeHistoryLoad = async () => false;
+    let waits = 0;
+    c.waitForHistoryMutation = async () => { waits++; };
+    const result = await c.scrollToLoadAll(null, 0, null, 0, quickStall);
+    assert.equal(result.reason, 'idle');
+    return waits;
+  };
+  assert.ok(await run(true) < await run(false));
+});
+
+test('walking up through already-loaded history keeps the scan alive; a scroll that stops moving ends incomplete', async () => {
+  const run = async ({ stuck }) => {
+    const c = loadContent();
+    await c.loadSelectors();
+    let now = 0;
+    c.Date = class extends Date { static now() { return now; } };
+    let top = 100000;
+    let minTop = top;
+    const container = { scrollHeight: 100400, clientHeight: 400,
+      get scrollTop() { return top; },
+      set scrollTop(value) { if (!stuck || value > top) top = value; minTop = Math.min(minTop, top); },
+      getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+    if (stuck) top = minTop = 50000;
+    c.findScrollContainer = () => container;
+    c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
+    c.getOldestTimestamp = () => 1;
+    c.sleep = async () => {};
+    c.provokeHistoryLoad = async () => false;
+    c.waitForHistoryMutation = async () => { now += 5000; };
+    return { result: await c.scrollToLoadAll(null, 0, null, 0, false), minTop };
+  };
+  const walked = await run({ stuck: false });
+  assert.equal(walked.result.reason, 'idle');
+  assert.ok(walked.minTop <= 1, 'the scan reached the top');
+  const stuck = await run({ stuck: true });
+  assert.equal(stuck.result.reason, 'stuck');
+  assert.match(stuck.result.warning, /may be missing/);
+});
+
+test('an export keeps its recovery data until the browser has saved every file', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let scans = 0;
+  c.scrollToLoadAll = async () => { scans++; return { messages: [{ text: 'a' }], reason: 'idle', warning: '' }; };
+  let state = 'interrupted';
+  let nextId = 1;
+  c.chrome.runtime.sendMessage = packageRecorder(() => ({ success: true, filename: 'x.txt', downloadIds: [nextId++] }), 1, () => state);
+  assert.equal(await c.runExport({ format: 'txt' }), 'error', 'an interrupted download fails the export');
+  state = 'complete';
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 1, 'the retry reused the kept scan');
+  vm.runInContext('DOWNLOAD_WAIT_MS = 0', c);
+  state = 'in_progress';
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 2);
+  assert.ok(vm.runInContext('retainedScan', c), 'a download still in progress keeps the scan');
+});
+
+test('an HTML export that downloads media again drops packaged paths left from earlier attempts', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  c.downloadMedia = async () => ({ success: false });
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.zip' }; });
+  const imported = [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png', _localPath: 'media/1_p.png' }] }];
+  assert.equal(await c.gceExportFromMemory(imported), 'done');
+  assert.equal(packaged.messages[0].media[0]._localPath, undefined, 'the failed attachment links to its original URL');
+});
+
+test('a console export of a wider selection downloads its media again instead of reusing a filtered export\'s parts', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  const pic = (n, ts) => ({ text: n, absoluteTimestamp: ts, media: [{ url: `https://example.com/${n}`, name: n }] });
+  c.scrollToLoadAll = async () => ({ messages: [pic('old', Date.UTC(2020, 0, 1)), pic('new', Date.UTC(2025, 0, 1))], reason: 'date-boundary', warning: '' });
+  const downloaded = [];
+  c.downloadMedia = async url => { downloaded.push(url); return { success: true, base64: 'eA==', mimeType: 'image/png' }; };
+  let fail = true;
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.zip', downloadIds: [1] }; });
+  assert.equal(await c.runExport({ format: 'html', dateFrom: '2024-01-01' }), 'error');
+  assert.deepEqual(downloaded, ['https://example.com/new']);
+  fail = false;
+  assert.equal(await c.gceExportFromMemory(), 'done');
+  assert.deepEqual(Array.from(packaged.messages, m => m.text), ['old', 'new'], 'index.html is rebuilt with every message');
+  assert.equal(packaged.mediaFiles.length, 2, 'the attachment outside the filter is downloaded too');
+});
+
+test('a retry downloads only the attachments that failed before and keeps the rest', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b'].map(n => ({ text: n, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  let offline = true;
+  const downloaded = [];
+  c.downloadMedia = async url => {
+    downloaded.push(url);
+    return offline && url.endsWith('/b') ? { success: false } : { success: true, base64: 'eA==', mimeType: 'image/png' };
+  };
+  let fail = true;
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.zip' }; });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  offline = false;
+  fail = false;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.deepEqual(downloaded, ['https://example.com/a', 'https://example.com/b', 'https://example.com/b'], 'only the failed attachment is fetched again');
+  assert.deepEqual(Array.from(packaged.mediaFiles, f => f.path).sort(), ['media/1_a', 'media/2_b']);
+  assert.deepEqual(Array.from(packaged.messages, m => m.media[0]._localPath), ['media/1_a', 'media/2_b']);
+  assert.doesNotMatch(packaged.history.warning || '', /attachments failed/);
+});
+
+test('only Chat\'s own creation notice marks the start of a conversation', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  vm.runInContext("SEL.messageText = 'div.msg'", c);
+  const check = (text, inMessage) => {
+    const node = { nodeValue: text, parentElement: { closest: () => inMessage ? {} : null } };
+    c.document.createTreeWalker = () => { let done = false; return { currentNode: node, nextNode: () => !done && (done = true) }; };
+    c.findScrollContainer = () => ({});
+    return c.conversationStartVisible();
+  };
+  assert.equal(check('Claudio created this chat', false), true);
+  assert.equal(check('I created this chat for the project.', false), false, 'a sentence mentioning it is not the notice');
+  assert.equal(check('Claudio created this chat', true), false, 'a message quoting it is not the notice');
+});
+
+test('recovering another conversation\'s stored segments keeps that conversation\'s name', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Open chat';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/OPEN' };
+  const store = { 'gceSegmentJob:9': { id: 'j9', segments: 1, name: 'Closed chat', at: 1 }, 'gceSegment:j9:0': [{ text: 'a', absoluteTimestamp: 1 }] };
+  c.chrome.storage.local = {
+    async get(keys) { return keys == null ? { ...store } : Object.fromEntries([].concat(keys).filter(k => k in store).map(k => [k, store[k]])); },
+    async set() {}, async remove() {}
+  };
+  const saved = [];
+  c.saveScanBackup = (messages, name) => saved.push(name);
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(packaged.conversationName, 'Closed chat');
+  assert.equal(packaged.stats.conversation, 'Closed chat');
+  vm.runInContext('retainedScan = null', c);
+  await c.gceSaveBackup();
+  assert.deepEqual(saved, ['Closed chat']);
+});
+
+test('exports carry stats about the version, message range and scan', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.chrome.runtime.getManifest = () => ({ version: '3.0.0' });
+  c.scrollToLoadAll = async () => ({ messages: [
+    { text: 'a', absoluteTimestamp: Date.UTC(2022, 7, 30) }, { text: 'b', absoluteTimestamp: Date.UTC(2026, 9, 24) }
+  ], reason: 'idle', warning: '' });
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  const { stats } = packaged;
+  assert.equal(stats.extensionVersion, '3.0.0');
+  assert.equal(stats.messages, 2);
+  assert.equal(stats.firstMessageAt, '2022-08-30T00:00:00.000Z');
+  assert.equal(stats.lastMessageAt, '2026-10-24T00:00:00.000Z');
+  assert.equal(stats.scan.reason, 'idle');
+  assert.equal(stats.scan.segments, 1);
+  assert.equal(typeof stats.scan.seconds, 'number');
+  assert.equal(stats.format, 'txt');
+});
+
+test('console export packages on-page messages with media as a complete export, without scrolling', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/u/0/frame' };
+  c.scrollToLoadAll = async () => { throw new Error('must not scroll'); };
+  c.extractMessages = () => [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png' }] }];
+  c.downloadMedia = async () => ({ success: true, base64: 'eA==', mimeType: 'image/png' });
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.zip' }; });
+  assert.equal(await c.gceExportFromMemory(), 'done');
+  assert.equal(packaged.messages.length, 1);
+  assert.equal(packaged.mediaFiles.length, 1);
+  assert.equal(packaged.history.reason, 'recovery');
+  assert.equal(packaged.history.warning, '');
+  assert.equal(packaged.checkpoint, null, 'recovered messages never advance the checkpoint');
+});
+
+test('a console export keeps the kept scan\'s incomplete-history warning', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.location = { href: 'https://chat.google.com/app/chat/SPACE' };
+  vm.runInContext("retainedScan = { url: '', dateFromTs: 0, at: 0, history: { messages: [{ text: 'a', absoluteTimestamp: 5 }], reason: 'stalled', warning: 'may be incomplete' } }", c);
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.gceExportFromMemory(null, { format: 'txt' }), 'done');
+  assert.equal(packaged.history.reason, 'stalled');
+  assert.equal(packaged.history.warning, 'may be incomplete');
+  assert.equal(packaged.checkpoint, null);
+});
+
+test('a cancel during preparation stops the export before the history scan starts', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.checkpointScopeFromPage = () => { vm.runInContext('exportController.abort()', c); return ''; };
+  let scanned = false;
+  c.scrollToLoadAll = async () => { scanned = true; return { messages: [], reason: 'idle', warning: '' }; };
+  assert.equal(await c.runExport({ format: 'txt' }), 'cancelled');
+  assert.equal(scanned, false);
+});
+
+test('an attachment larger than one message is staged in pieces and joined in order', async () => {
+  const c = loadContent();
+  vm.runInContext('MEDIA_CHUNK_CHARS = 4', c);
+  const sent = [];
+  c.chrome.runtime.sendMessage = async msg => { sent.push(msg); return { success: true }; };
+  await c.sendPackage('html', { messages: [], mediaFiles: [{ path: 'media/a', base64: 'aa' }, { path: 'media/big', mimeType: 'video/mp4', base64: '0123456789' }] });
+  const pieces = sent.filter(m => m.mediaPiece).map(m => [m.mediaPiece.index, m.mediaPiece.count, m.mediaPiece.base64]);
+  assert.deepEqual(pieces, [[0, 3, '0123'], [1, 3, '4567'], [2, 3, '89']]);
+  assert.deepEqual(Array.from(sent.find(m => m.mediaFiles).mediaFiles, f => f.path), ['media/a']);
+  assert.deepEqual({ ...sent.at(-1).expected }, { messages: 0, mediaFiles: 2 });
+});
+
+test('advanced scan options turn off segmentation, retry reuse and backups; stopping always keeps messages', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.chrome.storage.local.get = async () => ({ gceSettings: { segmentedScan: false, retryReuse: false, scanBackup: false, stopKeepsMessages: false } });
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let backups = 0;
+  c.saveScanBackup = () => { backups++; };
+  const limits = [];
+  let stopDuringScan;
+  c.scrollToLoadAll = async (_progress, _cutoff, _signal, segmentLimit) => {
+    limits.push(segmentLimit);
+    stopDuringScan = vm.runInContext('historyScanStop', c);
+    return { messages: Array.from({ length: 1200 }, (_, i) => ({ text: String(i) })), reason: 'idle', warning: '' };
+  };
+  let fail = true;
+  c.chrome.runtime.sendMessage = packageRecorder(() => fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' });
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.deepEqual(limits, [0, 0], 'no segmentation, and the retry rescans');
+  assert.ok(stopDuringScan, 'the first click always stops the scan and keeps messages, even with an outdated setting stored');
+  assert.equal(backups, 0);
+});
+
+test('segment size comes from the settings and falls back to 4000 for unsupported values', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  let stored = { segmentSize: 2000 };
+  c.chrome.storage.local.get = async () => ({ gceSettings: stored });
+  assert.equal((await c.readScanOptions()).segmentSize, 2000);
+  stored = { segmentSize: 1000 };
+  assert.equal((await c.readScanOptions()).segmentSize, 4000);
+  stored = { segmentSize: '3000' };
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let limit;
+  c.scrollToLoadAll = async (_p, _c, _s, segmentLimit) => { limit = segmentLimit; return { messages: [{ text: 'a' }], reason: 'idle', warning: '' }; };
+  c.chrome.runtime.sendMessage = packageRecorder(() => ({ success: true, filename: 'x.txt' }));
+  await c.runExport({ format: 'txt' });
+  assert.equal(limit, 3000);
+});
+
+test('segmented progress shows messages in this segment and the running total', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.sleep = async () => {};
+  c.chrome.storage.local.set = async () => {};
+  c.loadSegments = async () => [[]];
+  const shown = [];
+  c.showProgress = text => shown.push(text);
+  c.scrollToLoadAll = async onProgress => {
+    onProgress('Loading history... 1500 messages collected', 1500);
+    onProgress('Reached date range boundary — stopping scroll.');
+    return { messages: [], reason: 'idle', warning: '' };
+  };
+  await c.runExport({ format: 'txt', segmentJob: { id: 'j', segments: 2, collected: 8000 } });
+  assert.ok(shown.includes('Segment 3: loading history... 1,500 messages in this segment, ~9,500 total'));
+  assert.ok(shown.includes('Segment 3: Reached date range boundary — stopping scroll.'));
+});
+
+test('turning off DOM pruning scans without detaching anything', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  vm.runInContext('scanOptions = { ...scanOptions, pruneDom: false }', c);
+  c.createHistoryPruner = () => { throw new Error('pruner must not be created'); };
+  const container = { scrollHeight: 1200, clientHeight: 400, scrollTop: 800,
+    getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+  c.findScrollContainer = () => container;
+  c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
+  c.getOldestTimestamp = () => 1;
+  const controller = new AbortController();
+  const pending = c.scrollToLoadAll(null, 0, controller.signal);
+  controller.abort();
+  assert.equal((await pending).reason, 'stopped');
 });
 
 test('conversation identity comes from the chat address', () => {

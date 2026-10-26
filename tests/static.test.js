@@ -9,7 +9,7 @@ const root = path.join(__dirname, '..');
 
 test('2.2 retains Gmail-integrated Chat support in Chrome extension', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'chrome', 'manifest.json'), 'utf8'));
-  assert.equal(manifest.version, '2.2.0');
+  assert.equal(manifest.version, '3.0.0');
   const popup = fs.readFileSync(path.join(root, 'chrome', 'popup.html'), 'utf8');
   assert.ok(popup.includes(`v${manifest.version}`));
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version, manifest.version);
@@ -22,7 +22,7 @@ test('2.2 retains Gmail-integrated Chat support in Chrome extension', () => {
 
 test('2.2 supports Firefox Add-on with Gecko settings and background scripts', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'firefox', 'manifest.json'), 'utf8'));
-  assert.equal(manifest.version, '2.2.0');
+  assert.equal(manifest.version, '3.0.0');
   assert.equal(manifest.browser_specific_settings?.gecko?.id, 'google-chat-exporter@vishwas-r');
   assert.ok(manifest.browser_specific_settings?.gecko?.strict_min_version);
   assert.ok(manifest.browser_specific_settings?.gecko_android?.strict_min_version);

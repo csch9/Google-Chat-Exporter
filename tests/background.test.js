@@ -23,7 +23,7 @@ function loadBackground() {
     storage: { local: {
       async get(key) { return key ? { [key]: stored[key] } : { ...stored }; },
       async set(values) { Object.assign(stored, values); },
-      async remove(key) { delete stored[key]; }
+      async remove(keys) { [].concat(keys).forEach(key => delete stored[key]); }
     }, session: {
       async get(key) { return { [key]: session[key] }; },
       async set(values) { Object.assign(session, values); }
@@ -54,6 +54,49 @@ function loadBackground() {
   vm.runInContext(fs.readFileSync(filename, 'utf8'), context, { filename });
   return context;
 }
+
+test('large HTML exports are split into ZIP volumes below the string limit', async () => {
+  const context = loadBackground();
+  const zips = [];
+  context.JSZip = class {
+    constructor() { this.paths = []; zips.push(this); }
+    file(p) { this.paths.push(p); }
+    async generateAsync() { return 'eA=='; }
+  };
+  const downloads = [];
+  context.chrome.downloads.download = (options, callback) => { downloads.push(options.filename); callback(downloads.length); };
+  vm.runInContext('ZIP_PART_BASE64_BUDGET = 10', context);
+  const mediaFiles = ['a', 'b', 'c'].map(n => ({ path: `media/${n}`, base64: 'x'.repeat(6) }));
+  const result = await context.packageHtml({ conversationName: 'Big', messages: [], mediaFiles, exportDate: new Date().toISOString(), history: {} });
+  assert.equal(result.parts, 3);
+  assert.deepEqual(zips.map(z => z.paths), [['index.html', 'styles.css', 'media/a'], ['media/b'], ['media/c']]);
+  assert.equal(downloads.length, 3);
+  assert.match(downloads[0], /_part1of3\.zip$/);
+  assert.equal(result.downloadId, 3);
+});
+
+test('export stats go into the first ZIP part and the TXT header', async () => {
+  const context = loadBackground();
+  const zips = [];
+  context.JSZip = class {
+    constructor() { this.files = {}; zips.push(this); }
+    file(p, data) { this.files[p] = data; }
+    async generateAsync() { return 'eA=='; }
+  };
+  const urls = [];
+  context.chrome.downloads.download = (options, callback) => { urls.push(options.url); callback(urls.length); };
+  const stats = { extension: 'Google Chat Exporter', extensionVersion: '3.0.0', messages: 2, exportSeconds: 754,
+    firstMessageAt: '2022-08-30T10:00:00.000Z', lastMessageAt: '2026-10-24T10:00:00.000Z',
+    scan: { reason: 'idle', seconds: 720, segments: 3, stallRetries: 2 } };
+  await context.packageHtml({ conversationName: 'C', messages: [], mediaFiles: [], exportDate: new Date().toISOString(), history: {}, stats });
+  assert.equal(JSON.parse(zips[0].files['export-info.json']).extensionVersion, '3.0.0');
+
+  await context.packageTxt({ conversationName: 'C', messages: [], exportDate: new Date().toISOString(), history: {}, stats });
+  const text = Buffer.from(urls.at(-1).split(',')[1], 'base64').toString('utf8');
+  assert.match(text, /Scan: +12m 0s, 3 segments, 2 stall retries, ended: idle/);
+  assert.match(text, /Total: +12m 34s/);
+  assert.match(text, /Exporter: +Google Chat Exporter 3\.0\.0/);
+});
 
 test('safeResourceUrl permits HTTPS and safe packaged media paths', () => {
   const context = loadBackground();
@@ -115,6 +158,58 @@ test('background cancellation aborts the matching request and prevents retries',
   assert.equal(signal.aborted, true);
   assert.equal(calls, 1);
   assert.equal(vm.runInContext('mediaRequests.size', c), 0);
+});
+
+test('staged export chunks are merged into one package and cleared afterwards', async () => {
+  const c = loadBackground();
+  let download;
+  c.chrome.downloads.download = (options, callback) => { download = options; callback(1); };
+  const listener = c.chrome.runtime.onMessage.listener;
+  const sender = { tab: { id: 5 }, frameId: 0 };
+  const send = msg => new Promise(resolve => { if (!listener(msg, sender, resolve)) resolve(); });
+  await send({ action: 'stagePackageParts', stageId: 's1', messages: [{ sender: 'A', timestamp: '1', text: 'one', media: [] }] });
+  await send({ action: 'stagePackageParts', stageId: 's1', messages: [{ sender: 'B', timestamp: '2', text: 'two', media: [] }] });
+  const payload = { conversationName: 'Fixture', exportDate: new Date().toISOString(), history: { reason: 'idle' } };
+  const response = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's1', payload, expected: { messages: 2, mediaFiles: 0 } });
+  assert.equal(response.success, true);
+  const text = Buffer.from(download.url.split(',')[1], 'base64').toString();
+  assert.match(text, /one/);
+  assert.match(text, /two/);
+  assert.equal(vm.runInContext('stagedPackages.size', c), 0);
+  const lost = await send({ action: 'packageAndDownload', format: 'txt', stageId: 'missing', payload });
+  assert.equal(lost.success, false);
+  // Simulates a worker restart after the first chunk: only the later chunk reached this stage.
+  await send({ action: 'stagePackageParts', stageId: 's2', messages: [{ sender: 'B', timestamp: '2', text: 'two', media: [] }] });
+  const partial = await send({ action: 'packageAndDownload', format: 'txt', stageId: 's2', payload, expected: { messages: 2, mediaFiles: 0 } });
+  assert.equal(partial.success, false);
+  assert.match(partial.error, /incomplete/);
+
+  // An oversized attachment arrives in pieces; a missing piece leaves it out and fails the count check.
+  for (const [index, base64] of [[0, 'eA'], [1, '==']]) {
+    await send({ action: 'stagePackageParts', stageId: 's3', mediaPiece: { path: 'media/v', mimeType: 'video/mp4', index, count: 2, base64 } });
+  }
+  assert.equal(vm.runInContext("stagedPackages.get('5:0:s3').mediaFiles[0].base64", c), 'eA==');
+  await send({ action: 'stagePackageParts', stageId: 's4', mediaPiece: { path: 'media/v', index: 1, count: 2, base64: '==' } });
+  assert.equal(vm.runInContext("stagedPackages.get('5:0:s4').mediaFiles.length", c), 0);
+});
+
+test('a multi-part checkpoint advances only when every part has completed', async () => {
+  const c = loadBackground();
+  const states = { 1: 'interrupted', 2: 'complete' };
+  c.chrome.downloads.search = async ({ id }) => [{ state: states[id] }];
+  const key = 'gceCheckpoint:' + 'a'.repeat(64);
+  await c.queueCheckpoint([1, 2], { key, value: { timestamp: 100, fingerprints: [] } });
+  assert.equal((await c.chrome.storage.local.get(key))[key], undefined, 'an interrupted earlier part blocks the checkpoint');
+  assert.equal((await c.chrome.storage.local.get('gcePending:1'))['gcePending:1'], undefined);
+
+  states[1] = 'in_progress';
+  await c.queueCheckpoint([1, 2], { key, value: { timestamp: 100, fingerprints: [] } });
+  assert.equal((await c.chrome.storage.local.get(key))[key], undefined);
+  states[1] = 'complete';
+  c.chrome.downloads.onChanged.listener({ id: 1, state: { current: 'complete' } });
+  await vm.runInContext('checkpointQueue', c);
+  assert.equal((await c.chrome.storage.local.get(key))[key].timestamp, 100);
+  assert.equal((await c.chrome.storage.local.get('gcePending:2'))['gcePending:2'], undefined);
 });
 
 test('saved TXT and HTML carry incomplete-history warnings', async () => {

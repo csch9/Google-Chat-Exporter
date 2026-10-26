@@ -7,6 +7,8 @@ if (typeof importScripts === 'function' && typeof JSZip === 'undefined') {
   importScripts('lib/jszip.min.js');
 }
 const mediaRequests = new Map();
+// Export data arrives in chunks because one runtime message is capped at 64 MiB.
+const stagedPackages = new Map();
 // Persist pending download/checkpoint associations so worker suspension is safe.
 let checkpointQueue = Promise.resolve();
 function serializeCheckpoint(work) {
@@ -15,13 +17,15 @@ function serializeCheckpoint(work) {
   return next;
 }
 
+// A multi-part export is pending under each part's download and advances only once every part completed.
 async function reconcileCheckpoint(downloadId) {
   const pendingKey = `gcePending:${downloadId}`;
   const pending = (await chrome.storage.local.get(pendingKey))[pendingKey];
   if (!pending) return;
-  const [download] = await chrome.downloads.search({ id: downloadId });
-  if (download?.state === 'in_progress') return;
-  if (download?.state === 'complete') {
+  const ids = pending.downloads || [downloadId];
+  const states = await Promise.all(ids.map(async id => (await chrome.downloads.search({ id }))[0]?.state));
+  if (states.includes('in_progress')) return;
+  if (states.every(state => state === 'complete')) {
     const old = (await chrome.storage.local.get(pending.key))[pending.key];
     if (!old || pending.value.timestamp > old.timestamp) {
       await chrome.storage.local.set({ [pending.key]: pending.value });
@@ -30,19 +34,22 @@ async function reconcileCheckpoint(downloadId) {
       await chrome.storage.local.set({ [pending.key]: { ...old, fingerprints } });
     }
   }
-  await chrome.storage.local.remove(pendingKey);
+  await chrome.storage.local.remove(ids.map(id => `gcePending:${id}`));
 }
 
-function queueCheckpoint(downloadId, checkpoint) {
-  if (!/^gceCheckpoint:[a-f0-9]{64}$/.test(checkpoint.key) ||
+function queueCheckpoint(downloadIds, checkpoint) {
+  const ids = [].concat(downloadIds);
+  if (!ids.length || !ids.every(Number.isInteger) ||
+      !/^gceCheckpoint:[a-f0-9]{64}$/.test(checkpoint.key) ||
       !Number.isFinite(checkpoint.value?.timestamp) || checkpoint.value.timestamp <= 0 ||
       !Array.isArray(checkpoint.value.fingerprints) ||
       !checkpoint.value.fingerprints.every(id => /^[a-f0-9]{64}$/.test(id))) {
     throw new Error('Invalid checkpoint');
   }
+  const pending = { ...checkpoint, downloads: ids };
   return serializeCheckpoint(async () => {
-    await chrome.storage.local.set({ [`gcePending:${downloadId}`]: checkpoint });
-    await reconcileCheckpoint(downloadId);
+    await chrome.storage.local.set(Object.fromEntries(ids.map(id => [`gcePending:${id}`, pending])));
+    await reconcileCheckpoint(ids[ids.length - 1]);
   });
 }
 
@@ -208,30 +215,93 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // keep channel open
   }
 
+  if (msg.action === 'stagePackageParts') {
+    const key = mediaRequestKey(sender, msg.stageId);
+    const staged = stagedPackages.get(key) || { messages: [], mediaFiles: [] };
+    for (const item of msg.messages || []) staged.messages.push(item);
+    for (const item of msg.mediaFiles || []) staged.mediaFiles.push(item);
+    // An attachment too large for one message arrives in order; a gap leaves it out and fails the count check.
+    const piece = msg.mediaPiece;
+    if (piece) {
+      if (piece.index === 0) staged.pieces = [];
+      if (staged.pieces?.length === piece.index) staged.pieces.push(piece.base64);
+      else staged.pieces = null;
+      if (staged.pieces && piece.index === piece.count - 1) {
+        staged.mediaFiles.push({ path: piece.path, mimeType: piece.mimeType, base64: staged.pieces.join('') });
+        staged.pieces = null;
+      }
+    }
+    stagedPackages.set(key, staged);
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (msg.action === 'getTabId') {
+    sendResponse({ tabId: sender.tab?.id });
+    return false;
+  }
+
+  if (msg.action === 'downloadStates') {
+    const ids = (msg.ids || []).filter(Number.isInteger);
+    Promise.all(ids.map(async id => [id, (await chrome.downloads.search({ id }))[0]?.state || 'missing']))
+      .then(entries => sendResponse({ states: Object.fromEntries(entries) }), () => sendResponse({ states: {} }));
+    return true;
+  }
+
+  if (msg.action === 'discardStagedPackage') {
+    stagedPackages.delete(mediaRequestKey(sender, msg.stageId));
+    sendResponse({ success: true });
+    return false;
+  }
+
   if (msg.action === 'packageAndDownload') {
     // Content script sends extracted data here for packaging
     (async () => {
+      const stageKey = mediaRequestKey(sender, msg.stageId);
       try {
-        if (msg.payload.sourceUrl && sender.tab?.id) {
+        let payload = msg.payload;
+        if (msg.stageId) {
+          const staged = stagedPackages.get(stageKey);
+          if (!staged) throw new Error('Export data was lost before packaging. Please retry.');
+          // A worker restart mid-transfer starts a fresh stage that lacks the earlier chunks.
+          if (staged.messages.length !== msg.expected?.messages || staged.mediaFiles.length !== msg.expected?.mediaFiles) {
+            throw new Error('Export data was incomplete before packaging. Please retry.');
+          }
+          payload = { ...msg.payload, messages: staged.messages, mediaFiles: staged.mediaFiles };
+        }
+        if (payload.sourceUrl && sender.tab?.id) {
           const tab = await chrome.tabs.get(sender.tab.id);
-          if (tab?.url && !isSameConversationUrl(msg.payload.sourceUrl, tab.url)) {
+          if (tab?.url && !isSameConversationUrl(payload.sourceUrl, tab.url)) {
             throw new Error('Conversation changed during export. Please retry.');
           }
         }
         const result = msg.format === 'html'
-          ? await packageHtml(msg.payload)
-          : await packageTxt(msg.payload);
+          ? await packageHtml(payload)
+          : await packageTxt(payload);
         let checkpointWarning = '';
-        if (msg.payload.checkpoint) {
-          try { await queueCheckpoint(result.downloadId, msg.payload.checkpoint); }
+        if (payload.checkpoint) {
+          try { await queueCheckpoint([...(payload.partDownloads || []), ...result.downloadIds], payload.checkpoint); }
           catch { checkpointWarning = 'Export downloaded, but its checkpoint could not be saved. Next export may repeat messages.'; }
         }
         sendResponse({ success: true, ...result, checkpointWarning });
       } catch (err) {
         console.error('[GCE BG] Package error:', err);
         sendResponse({ success: false, error: err.message });
+      } finally {
+        stagedPackages.delete(stageKey);
       }
     })();
+    return true;
+  }
+
+  if (msg.action === 'navigateTab') {
+    // Segmented scans reopen the same tab at an older message.
+    if (!sender.tab?.id || !/^https:\/\/(chat|mail)\.google\.com\//.test(String(msg.url || ''))) {
+      sendResponse({ success: false, error: 'Invalid navigation target.' });
+      return false;
+    }
+    chrome.tabs.update(sender.tab.id, { url: msg.url })
+      .then(() => sendResponse({ success: true }), err => sendResponse({ success: false, error: err.message }));
     return true;
   }
 
@@ -359,7 +429,7 @@ async function ensureContentScript(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
-      files: ['content.js']
+      files: ['lib/jszip.min.js', 'content.js']
     });
     // Wait for initialization
     await sleep(400);
@@ -395,7 +465,7 @@ async function getSettings() {
 
 // ── TXT Packaging ───────────────────────────────────────────
 
-async function packageTxt({ conversationName, messages, exportDate, history }) {
+async function packageTxt({ conversationName, messages, exportDate, history, stats }) {
   const name = conversationName || 'Google Chat';
   const line = '─'.repeat(60);
   const header = [
@@ -408,6 +478,7 @@ async function packageTxt({ conversationName, messages, exportDate, history }) {
     `Exported:  ${new Date(exportDate).toLocaleString()}`,
     ...(history?.warning ? [`Warning:   ${history.warning}`] : []),
     ...(history?.since ? [`New since: ${new Date(history.since).toISOString()}`] : []),
+    ...statsHeaderLines(stats),
     '',
     line,
     ''
@@ -447,33 +518,44 @@ async function packageTxt({ conversationName, messages, exportDate, history }) {
   const dataUrl = 'data:text/plain;charset=utf-8;base64,' + b64EncodeUtf8(fullText);
 
   const downloadId = await triggerDownload(dataUrl, filename);
-  return { filename, downloadId };
+  return { filename, downloadId, downloadIds: [downloadId] };
 }
 
 // ── HTML + ZIP Packaging ────────────────────────────────────
 
-async function packageHtml({ conversationName, messages, mediaFiles, exportDate, history }) {
+// JS strings cap near 512 Mi chars and the ZIP is built as base64, so media is split across volumes well below that.
+let ZIP_PART_BASE64_BUDGET = 200_000_000;
+
+async function packageHtml({ conversationName, messages, mediaFiles, exportDate, history, part, stats }) {
   const name = conversationName || 'Google Chat';
-  const zip = new JSZip();
-
-  const htmlContent = generateHtml({ conversationName: name, messages, exportDate, history });
-  const cssContent = generateCss();
-
-  zip.file('index.html', htmlContent);
-  zip.file('styles.css', cssContent);
-
-  if (mediaFiles && mediaFiles.length > 0) {
-    for (const file of mediaFiles) {
-      zip.file(file.path, file.base64, { base64: true });
-    }
+  const parts = [[]];
+  let size = 0;
+  for (const file of mediaFiles || []) {
+    if (size && size + file.base64.length > ZIP_PART_BASE64_BUDGET) { parts.push([]); size = 0; }
+    parts[parts.length - 1].push(file);
+    size += file.base64.length;
   }
+  // The content script sends one request per part; index.html only goes into the first.
+  const offset = part ? part.index : 0;
+  const count = part ? Math.max(part.count, offset + parts.length) : parts.length;
 
-  const zipBase64 = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-  const filename = `${sanitize(name)}_${dateStr()}.zip`;
-  const dataUrl = 'data:application/zip;base64,' + zipBase64;
-
-  const downloadId = await triggerDownload(dataUrl, filename);
-  return { filename, downloadId };
+  const base = `${sanitize(name)}_${dateStr()}`;
+  const filenames = [];
+  const downloadIds = [];
+  for (let i = 0; i < parts.length; i++) {
+    const zip = new JSZip();
+    if (offset + i === 0) {
+      zip.file('index.html', generateHtml({ conversationName: name, messages, exportDate, history }));
+      zip.file('styles.css', generateCss());
+      if (stats) zip.file('export-info.json', JSON.stringify(stats, null, 2));
+    }
+    for (const file of parts[i]) zip.file(file.path, file.base64, { base64: true });
+    const zipBase64 = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    const filename = count > 1 ? `${base}_part${offset + i + 1}of${count}.zip` : `${base}.zip`;
+    downloadIds.push(await triggerDownload('data:application/zip;base64,' + zipBase64, filename));
+    filenames.push(filename);
+  }
+  return { filename: filenames.join(', '), downloadId: downloadIds[downloadIds.length - 1], downloadIds, parts: count };
 }
 
 // ── HTML Generator ──────────────────────────────────────────
@@ -778,6 +860,25 @@ function formatTextContent(text) {
 function fmtDur(ms) {
   const s = Math.round((ms || 0) / 1000);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function fmtElapsed(seconds) {
+  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
+  return h ? `${h}h ${m}m ${s}s` : m ? `${m}m ${s}s` : `${s}s`;
+}
+
+function statsHeaderLines(stats) {
+  if (!stats) return [];
+  const scan = stats.scan || {};
+  const scanLine = scan.seconds == null ? 'not scrolled (messages on the page or from memory)'
+    : `${fmtElapsed(scan.seconds)}, ${scan.segments} segment${scan.segments === 1 ? '' : 's'}` +
+      `${scan.stallRetries ? `, ${scan.stallRetries} stall retries` : ''}, ended: ${scan.reason}`;
+  return [
+    `Range:     ${stats.firstMessageAt || '?'} → ${stats.lastMessageAt || '?'}`,
+    `Scan:      ${scanLine}`,
+    `Total:     ${fmtElapsed(stats.exportSeconds || 0)}`,
+    `Exporter:  ${stats.extension} ${stats.extensionVersion}`
+  ];
 }
 
 function b64EncodeUtf8(str) {

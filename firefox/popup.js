@@ -6,6 +6,16 @@
 
 const $ = id => document.getElementById(id);
 
+// Advanced scan options: settings key -> checkbox id. Defaults live in the checkboxes' `checked` state.
+const SCAN_OPTION_INPUTS = {
+  pruneDom: 'opt-prune-dom',
+  segmentedScan: 'opt-segmented-scan',
+  historyNudge: 'opt-history-nudge',
+  retryReuse: 'opt-retry-reuse',
+  scanBackup: 'opt-scan-backup',
+  diagnostics: 'opt-diagnostics'
+};
+
 // ── Settings persistence ─────────────────────────────────────
 
 async function loadSettings() {
@@ -17,6 +27,11 @@ async function loadSettings() {
     if (typeof s.includeMedia !== 'undefined') $('include-media').checked = s.includeMedia;
     if (s.dateFrom) $('date-from').value = s.dateFrom;
     $('incremental').checked = s.incremental === true;
+    for (const [key, id] of Object.entries(SCAN_OPTION_INPUTS)) {
+      if (typeof s[key] === 'boolean') $(id).checked = s[key];
+    }
+    if ([...$('opt-segment-size').options].some(o => Number(o.value) === s.segmentSize)) $('opt-segment-size').value = String(s.segmentSize);
+    updateSegmentSizeRow();
     updateIncrementalControls();
     updateMediaRowVisibility();
   } catch { /* storage not accessible */ }
@@ -30,7 +45,15 @@ function saveSettings() {
     dateFrom: $('date-from').value,
     incremental: $('incremental').checked
   };
+  for (const [key, id] of Object.entries(SCAN_OPTION_INPUTS)) settings[key] = $(id).checked;
+  settings.segmentSize = Number($('opt-segment-size').value);
   chrome.storage.local.set({ gceSettings: settings }).catch(() => {});
+}
+
+function updateSegmentSizeRow() {
+  const enabled = $('opt-segmented-scan').checked;
+  $('segment-size-row').style.opacity = enabled ? '1' : '0.45';
+  $('opt-segment-size').disabled = !enabled;
 }
 
 function updateMediaRowVisibility() {
@@ -240,5 +263,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('include-media').addEventListener('change', saveSettings);
   $('date-from').addEventListener('change', saveSettings);
   $('incremental').addEventListener('change', () => { updateIncrementalControls(); saveSettings(); });
+  for (const id of Object.values(SCAN_OPTION_INPUTS)) $(id).addEventListener('change', saveSettings);
+  $('opt-segmented-scan').addEventListener('change', updateSegmentSizeRow);
+  $('opt-segment-size').addEventListener('change', saveSettings);
   $('export-mode').addEventListener('change', toggleExportMode);
 });

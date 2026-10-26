@@ -80,6 +80,36 @@ function isInChatFrame() {
 let progressEl = null;
 let exportInProgress = false;
 let exportController = null;
+// Set while the history scan runs; aborting it stops scrolling but keeps the collected messages.
+let historyScanStop = null;
+// Last scan whose export did not complete, so a retry can skip rescanning: { url, dateFromTs, history, at }.
+let retainedScan = null;
+
+// Optional scan behaviours, toggled in the popup (stored with the other settings in gceSettings).
+const SCAN_OPTION_DEFAULTS = {
+  pruneDom: true,          // detach collected history from the page while scanning
+  segmentedScan: true,     // reopen Chat at the oldest collected message every segmentSize messages
+  segmentSize: 4000,       // one of SEGMENT_SIZES; smaller suits machines with less memory
+  historyNudge: true,      // send a wheel event as soon as the scan reaches the top
+  retryReuse: true,        // a failed export keeps its scan and media for the next attempt
+  scanBackup: true,        // download a JSON backup after long scans
+  diagnostics: false       // log scan timing, load latency and memory
+};
+let scanOptions = { ...SCAN_OPTION_DEFAULTS };
+const SEGMENT_SIZES = [2000, 3000, 4000, 5000];
+
+async function readScanOptions() {
+  try {
+    const { gceSettings } = await chrome.storage.local.get('gceSettings');
+    const stored = gceSettings || {};
+    return Object.fromEntries(Object.entries(SCAN_OPTION_DEFAULTS).map(([key, value]) => {
+      if (key === 'segmentSize') return [key, SEGMENT_SIZES.includes(Number(stored[key])) ? Number(stored[key]) : value];
+      return [key, typeof stored[key] === 'boolean' ? stored[key] : value];
+    }));
+  } catch {
+    return { ...SCAN_OPTION_DEFAULTS };
+  }
+}
 
 function showProgress(text, percent, state = 'working') {
   if (!progressEl) {
@@ -110,7 +140,7 @@ function showProgress(text, percent, state = 'working') {
       }
       .gce-header {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 10px;
         padding: 14px 16px 10px;
       }
@@ -131,11 +161,18 @@ function showProgress(text, percent, state = 'working') {
         font-size: 13px;
         color: #3c4043;
         flex: 1;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        overflow-wrap: anywhere;
+        line-height: 1.4;
+        max-height: 7em;
+        overflow-y: auto;
         font-weight: 500;
       }
+      .gce-hint {
+        font-size: 11px;
+        color: #80868b;
+        padding: 0 16px 10px 48px;
+      }
+      .gce-hint:empty { display: none; }
       .gce-close {
         background: none;
         border: none;
@@ -188,12 +225,17 @@ function showProgress(text, percent, state = 'working') {
           <span class="gce-label">Initializing...</span>
           <button class="gce-close" title="Dismiss">&times;</button>
         </div>
+        <div class="gce-hint"></div>
         <div class="gce-bar-wrap"><div class="gce-bar"></div></div>
       </div>`;
 
     document.documentElement.appendChild(progressEl);
     progressEl.querySelector('.gce-close').addEventListener('click', () => {
-      if (exportInProgress && exportController) {
+      if (exportInProgress && historyScanStop) {
+        historyScanStop.abort();
+        historyScanStop = null;
+        showProgress('Stopping scan — exporting the messages collected so far...', 15);
+      } else if (exportInProgress && exportController) {
         showProgress('Cancelling export...', 0);
         exportController.abort();
       } else {
@@ -207,6 +249,13 @@ function showProgress(text, percent, state = 'working') {
   const spinner = progressEl.querySelector('.gce-spinner');
 
   if (label) label.textContent = text;
+  // Tells the user what × does right now: stop-and-export while scanning, abort afterwards.
+  const hint = exportInProgress && historyScanStop ? '× stops loading and exports the messages collected so far'
+    : exportInProgress && exportController ? '× aborts the export without saving' : '';
+  const hintEl = progressEl.querySelector('.gce-hint');
+  if (hintEl) hintEl.textContent = hint;
+  const close = progressEl.querySelector('.gce-close');
+  if (close) close.title = hint || 'Dismiss';
   if (bar) {
     bar.style.width = percent + '%';
     bar.className = 'gce-bar' + (state === 'done' ? ' done' : state === 'error' ? ' error' : '');
@@ -230,6 +279,75 @@ function hideProgress() {
 
 // ── Scroll to Load All Messages ─────────────────────────────
 
+// Viewports of already-collected history kept attached below the visible area.
+const PRUNE_BUFFER_VIEWPORTS = 3;
+
+// Chat never evicts loaded history and DOM operations degrade with its size, so collected history is
+// detached during the scan. Each contiguous sibling run sits behind one comment marker: marker -> nodes (bottom-up).
+function createHistoryPruner(container) {
+  const runs = new Map();
+  let count = 0;
+  // Date of the topmost detached separator; stands in for it when no attached separator remains.
+  let leadingDate = '';
+  return {
+    get count() { return count; },
+    get leadingDate() { return leadingDate; },
+    prune() {
+      const items = container.querySelectorAll(`${SEL.dateSeparator}, ${SEL.messageGroups}`);
+      if (!items.length) return 0;
+      const limit = container.getBoundingClientRect().bottom + container.clientHeight * PRUNE_BUFFER_VIEWPORTS;
+      // Read all positions before writing so the pass forces a single layout.
+      let cut = items.length;
+      while (cut > 0 && items[cut - 1].getBoundingClientRect().top > limit) cut--;
+      if (cut === items.length) return 0;
+      // Per-message wrappers keep their height and nodes, so detach the outermost ancestor that lies wholly below the limit.
+      const roots = [];
+      let groups = 0;
+      let topDate = '';
+      for (let i = cut; i < items.length; i++) {
+        const item = items[i];
+        if (item.matches(SEL.dateSeparator)) topDate ||= cleanText(item.textContent);
+        else groups++;
+        let root = item;
+        while (root.parentElement && root.parentElement !== container &&
+          root.parentElement.getBoundingClientRect().top > limit) root = root.parentElement;
+        if (roots[roots.length - 1] !== root) roots.push(root);
+      }
+      if (topDate) leadingDate = topDate;
+      for (let i = roots.length - 1; i >= 0; i--) {
+        const root = roots[i];
+        const run = runs.get(root.nextSibling);
+        if (run) {
+          // Directly above an existing marker, so the marker already holds this position.
+          root.remove();
+          run.push(root);
+        } else {
+          const marker = document.createComment('gce-pruned');
+          root.replaceWith(marker);
+          runs.set(marker, [root]);
+        }
+      }
+      count += groups;
+      return groups;
+    },
+    restore() {
+      let lost = 0;
+      // Newest first: a later, outer root may contain markers of earlier runs, which only reconnect once it is back.
+      for (const [marker, nodes] of [...runs].reverse()) {
+        const fragment = document.createDocumentFragment();
+        // Chat may have reused a node elsewhere; leave those where they are.
+        for (let i = nodes.length - 1; i >= 0; i--) if (!nodes[i].isConnected) fragment.appendChild(nodes[i]);
+        if (marker.isConnected) marker.replaceWith(fragment);
+        else lost += fragment.childNodes.length;
+      }
+      runs.clear();
+      count = 0;
+      if (lost) console.warn(`[Google Chat Exporter] ${lost} detached messages could not be reattached (Chat re-rendered their container). Reload the tab before exporting from the page again.`);
+      return lost;
+    }
+  };
+}
+
 function findScrollContainer() {
   for (const sel of SEL.scrollContainers) {
     const el = document.querySelector(sel);
@@ -249,7 +367,7 @@ function findScrollContainer() {
   return best;
 }
 
-async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
+async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmentLimit = 0, quickStall = false) {
   const container = findScrollContainer();
   if (!container) {
     onProgress && onProgress('No scroll container found — exporting visible messages only');
@@ -262,82 +380,198 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null) {
   );
   const anchor = captureScrollAnchor(container);
   const extractionCache = createExtractionCache(container);
+  const pruner = scanOptions.pruneDom ? createHistoryPruner(container) : null;
   let reason = 'limit';
 
   const dedupMap = new Map();
-  const collectCurrent = () => {
-    for (const msg of extractMessages(extractionCache)) {
+  const collectCurrent = (force = false) => {
+    // No DOM mutations since the last pass means extraction would return the same messages.
+    const hasChanges = extractionCache.changed();
+    if (!force && !hasChanges) return;
+    for (const msg of extractMessages(extractionCache, pruner?.leadingDate || '')) {
       const key = msg._dedupKey || `${msg.sender}|${msg.absoluteTimestamp}|${(msg.text || '').slice(0, 80)}`;
       dedupMap.set(key, msg);
     }
   };
 
   try {
-    collectCurrent();
+    collectCurrent(true);
+    const startCount = dedupMap.size;
     let prevHeight = container.scrollHeight;
     let prevOldest = getOldestTimestamp();
     let stableBatches = 0;
     let batches = 0;
-    const MAX_BATCHES = 3000;
-    const STABLE_BATCH_LIMIT = 3;
+    const MAX_BATCHES = 50000;
+    const STABLE_BATCH_LIMIT = 8;
+    // Chat can keep re-rendering (height churn) at the history start; only real progress keeps the scan alive.
+    const NO_PROGRESS_LIMIT_MS = 90000;
+    let lastProgressAt = Date.now();
+    let walkingBack = false;
+    const timing = { wait: 0, collect: 0, prune: 0, pruned: 0, since: Date.now(), loads: 0, loadMs: 0, loadMax: 0, triggers: {} };
+    // Time from reaching the top until Chat delivers older history, labelled by the last nudge sent.
+    let topSince = 0;
+    let topTrigger = '';
+    const milestone = { next: Math.floor(dedupMap.size / 1000) * 1000 + 1000, at: Date.now(), batches: 0 };
+    const diagnostics = scanOptions.diagnostics;
+    if (diagnostics) console.log('[Google Chat Exporter] history scan started', {
+      messages: dedupMap.size, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight,
+      domNodes: document.getElementsByTagName?.('*').length
+    });
 
     onProgress && onProgress('Scrolling up to load full history...');
 
-    while (batches < MAX_BATCHES) {
-      throwIfAborted(signal);
-      batches++;
+    try {
+      while (batches < MAX_BATCHES) {
+        throwIfAborted(signal);
+        batches++;
 
-      // Stop early if we've passed our date range
-      if (dateFromTs) {
+        // Stop early if we've passed our date range
+        if (dateFromTs) {
+          const oldest = getOldestTimestamp();
+          if (oldest && oldest < dateFromTs) {
+            onProgress && onProgress('Reached date range boundary — stopping scroll.');
+            reason = 'date-boundary';
+            break;
+          }
+        }
+
+        // Overlap viewports so virtualized messages are collected before eviction.
+        const beforeCount = dedupMap.size;
+        const previousTop = container.scrollTop;
+        const targetTop = Math.max(0, previousTop - Math.max(1, container.clientHeight * 0.75));
+        if (targetTop <= 1 && previousTop <= 1 && stableBatches > 0) {
+          if (walkingBack) walkingBack = false;
+          else {
+            topTrigger = `retry${stableBatches}`;
+            if (await provokeHistoryLoad(container, stableBatches, signal)) { walkingBack = true; continue; }
+          }
+        }
+        const wait = waitForHistoryMutation(container, prevHeight, prevOldest,
+          targetTop > 1 ? 250 : Math.min(600 * (stableBatches + 1), 4000), signal, targetTop > 1);
+        container.scrollTop = targetTop;
+        if (targetTop <= 1 && !topSince) {
+          topSince = Date.now();
+          topTrigger = 'arrival';
+          // Chat may only fetch on user-like input; nudging now avoids sitting through the passive back-off first.
+          if (scanOptions.historyNudge && typeof WheelEvent === 'function') container.dispatchEvent?.(new WheelEvent('wheel', { deltaY: -300, bubbles: true, cancelable: true }));
+        }
+        let mark = Date.now();
+        await wait;
+        timing.wait += Date.now() - mark;
+        mark = Date.now();
+        collectCurrent();
+        timing.collect += Date.now() - mark;
+
         const oldest = getOldestTimestamp();
-        if (oldest && oldest < dateFromTs) {
-          onProgress && onProgress('Reached date range boundary — stopping scroll.');
-          reason = 'date-boundary';
-          break;
+        const curHeight = container.scrollHeight;
+        const advanced = dedupMap.size > beforeCount || curHeight !== prevHeight || (oldest && oldest !== prevOldest);
+        if (topSince && oldest && prevOldest && oldest < prevOldest) {
+          const ms = Date.now() - topSince;
+          timing.loads++;
+          timing.loadMs += ms;
+          timing.loadMax = Math.max(timing.loadMax, ms);
+          timing.triggers[topTrigger] = (timing.triggers[topTrigger] || 0) + 1;
+          topSince = 0;
+        }
+        milestone.batches++;
+        while (dedupMap.size >= milestone.next) {
+          if (diagnostics) console.log(`[Google Chat Exporter] reached ${milestone.next} messages`, {
+            secondsForLast1000: Math.round((Date.now() - milestone.at) / 1000), steps: milestone.batches, heapMB: heapMB()
+          });
+          Object.assign(milestone, { next: milestone.next + 1000, at: Date.now(), batches: 0 });
+        }
+        // Walking up through already-loaded history is progress too; small moves near the top can be Chat re-rendering.
+        const movedUp = !walkingBack && previousTop > container.clientHeight && container.scrollTop < previousTop - 1;
+        if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest)) || movedUp) lastProgressAt = Date.now();
+        else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = container.scrollTop <= container.clientHeight ? 'idle' : 'stuck'; break; }
+        // Without a way to reopen Chat at the oldest message, keep scanning in this page.
+        if (segmentLimit && dedupMap.size >= segmentLimit && oldestMessageLink()) { reason = 'segment'; break; }
+
+        if (advanced) {
+          stableBatches = 0;
+          walkingBack = false;
+          prevHeight = curHeight;
+          prevOldest = oldest;
+        } else if (container.scrollTop <= 1 && previousTop <= 1) {
+          stableBatches++;
+          // A reopened page that barely loaded anything is usually stuck; give up early so it can be reopened elsewhere.
+          const limit = quickStall && dedupMap.size - startCount < SEGMENT_STALL_MESSAGES ? QUICK_STALL_BATCH_LIMIT : STABLE_BATCH_LIMIT;
+          if (stableBatches >= limit) { reason = 'idle'; break; }
+        }
+        // Pruning shrinks scrollHeight; rebase so it is not mistaken for newly loaded history.
+        mark = Date.now();
+        const pruned = pruner ? pruner.prune() : 0;
+        if (pruned) prevHeight = container.scrollHeight;
+        timing.prune += Date.now() - mark;
+        timing.pruned += pruned;
+
+        if (diagnostics && batches % 10 === 0) {
+          console.log('[Google Chat Exporter] scan timing', {
+            batches, messages: dedupMap.size, total: Date.now() - timing.since,
+            wait: timing.wait, collect: timing.collect, prune: timing.prune, prunedNow: timing.pruned,
+            scrollHeight: container.scrollHeight,
+            groups: container.querySelectorAll(SEL.messageGroups).length,
+            prunedTotal: pruner?.count ?? 0,
+            domNodes: document.getElementsByTagName?.('*').length,
+            historyLoads: timing.loads,
+            avgLoadMs: timing.loads ? Math.round(timing.loadMs / timing.loads) : null,
+            maxLoadMs: timing.loadMax,
+            loadTriggers: timing.triggers,
+            heapMB: heapMB()
+          });
+          Object.assign(timing, { wait: 0, collect: 0, prune: 0, pruned: 0, since: Date.now(), loads: 0, loadMs: 0, loadMax: 0, triggers: {} });
+        }
+
+        if (batches % 2 === 0) {
+          onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`, dedupMap.size);
         }
       }
-
-      // Overlap viewports so virtualized messages are collected before eviction.
-      const beforeCount = dedupMap.size;
-      const previousTop = container.scrollTop;
-      const targetTop = Math.max(0, previousTop - Math.max(1, container.clientHeight * 0.75));
-      const wait = waitForHistoryMutation(container, prevHeight, prevOldest,
-        targetTop > 1 ? 250 : 600 * (stableBatches + 1), signal, targetTop > 1);
-      container.scrollTop = targetTop;
-      await wait;
-      collectCurrent();
-
-      const oldest = getOldestTimestamp();
-      const curHeight = container.scrollHeight;
-      const advanced = dedupMap.size > beforeCount || curHeight !== prevHeight || (oldest && oldest !== prevOldest);
-
-      if (advanced) {
-        stableBatches = 0;
-        prevHeight = curHeight;
-        prevOldest = oldest;
-      } else if (container.scrollTop <= 1 && previousTop <= 1) {
-        stableBatches++;
-        if (stableBatches >= STABLE_BATCH_LIMIT) { reason = 'idle'; break; }
-      }
-
-      if (batches % 2 === 0) {
-        onProgress && onProgress(`Loading history... ${dedupMap.size} messages collected`);
-      }
+    } catch (err) {
+      // Aborting the scan signal means "stop scrolling"; the caller decides whether the whole export is cancelled.
+      if (err?.name !== 'AbortError') throw err;
+      reason = 'stopped';
     }
 
-    collectCurrent();
-    const warning = reason === 'date-boundary' ? '' : reason === 'limit'
-      ? 'History scan reached its safety limit; export may be incomplete.'
+    collectCurrent(true);
+    console.log('[Google Chat Exporter] history scan finished', {
+      reason, batches, messages: dedupMap.size, stableBatches,
+      scrollTop: container.scrollTop, scrollHeight: container.scrollHeight, clientHeight: container.clientHeight,
+      groups: document.querySelectorAll(SEL.messageGroups).length
+    });
+    const warning = reason === 'limit' ? 'History scan reached its safety limit; export may be incomplete.'
+      : reason === 'stopped' ? 'History scan was stopped early; older messages are not included.'
+      : reason === 'stuck' ? 'History scan stopped making progress before reaching the top; older messages may be missing.'
       : '';
     onProgress && onProgress(warning ? `${dedupMap.size} messages collected. ${warning}` : `${dedupMap.size} messages collected.`);
 
-    return { reason, warning, messages: [...dedupMap.values()].sort(
+    return { reason, warning, startCount, messages: [...dedupMap.values()].sort(
       (a, b) => (a.absoluteTimestamp || 0) - (b.absoluteTimestamp || 0)
     ) };
   } finally {
     extractionCache.disconnect();
+    pruner?.restore();
     restoreScrollPosition(container, distanceFromBottom, anchor);
   }
+}
+
+// Chromium-only; undefined elsewhere.
+function heapMB() {
+  return typeof performance !== 'undefined' && performance.memory
+    ? Math.round(performance.memory.usedJSHeapSize / 1048576) : undefined;
+}
+
+// Chat fetches older history on scroll input, so a scrollTop pinned at 0 never triggers it; vary the trigger per retry.
+// Returns true when it moved far from the top so the caller can scroll back up like a user would.
+async function provokeHistoryLoad(container, attempt, signal) {
+  if (attempt === 2 && typeof WheelEvent === 'function') {
+    container.dispatchEvent?.(new WheelEvent('wheel', { deltaY: -300, bubbles: true, cancelable: true }));
+  } else if (attempt === 3) {
+    container.querySelector?.(SEL.messageGroups)?.scrollIntoView?.({ block: 'start' });
+  }
+  const farJump = attempt >= 4;
+  container.scrollTop = Math.min(container.clientHeight * (farJump ? 6 : 0.25), container.scrollHeight);
+  await sleep(60, signal);
+  return farJump;
 }
 
 function captureScrollAnchor(container) {
@@ -373,12 +607,15 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
     let settled = false;
     let settleTimer = 0;
     let timeoutTimer = 0;
+    let checkTimer = 0;
     let frame = null;
+    let framesDone = false;
 
     const cleanup = () => {
       observer.disconnect();
       clearTimeout(settleTimer);
       clearTimeout(timeoutTimer);
+      clearTimeout(checkTimer);
       signal?.removeEventListener('abort', cancel);
       if (frame !== null) cancelAnimationFrame(frame);
     };
@@ -397,12 +634,17 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
       reject(createAbortError());
     };
 
-    const observer = new MutationObserver(() => {
+    // Reading scrollHeight forces layout of the whole list, so check once per burst of mutations.
+    const check = () => {
+      checkTimer = 0;
       const historyAdvanced = container.scrollHeight !== initialHeight ||
         getOldestTimestamp() !== initialOldest;
-      if (!historyAdvanced) return;
+      if (!historyAdvanced) { if (framesDone && !settleTimer) finish(); return; }
       clearTimeout(settleTimer);
       settleTimer = setTimeout(finish, 120);
+    };
+    const observer = new MutationObserver(() => {
+      if (!checkTimer) checkTimer = setTimeout(check, 40);
     });
     observer.observe(container, { childList: true, subtree: true });
     timeoutTimer = setTimeout(finish, timeoutMs);
@@ -412,7 +654,8 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
       frame = requestAnimationFrame(() => {
         frame = requestAnimationFrame(() => {
           frame = null;
-          if (!settleTimer) finish();
+          framesDone = true;
+          if (!settleTimer && !checkTimer) finish();
         });
       });
     }
@@ -422,6 +665,10 @@ function waitForHistoryMutation(container, initialHeight, initialOldest, timeout
 }
 
 function getOldestTimestamp() {
+  // History renders oldest-first, so the first stamped node is the oldest; avoids a full-DOM scan per call.
+  const first = document.querySelector(SEL.absoluteTimestampAttr);
+  const firstValue = first ? parseInt(first.getAttribute(SEL.attrs.absoluteTimestamp), 10) || 0 : 0;
+  if (firstValue) return firstValue;
   let oldest = 0;
   document.querySelectorAll(SEL.absoluteTimestampAttr).forEach(ts => {
     const value = parseInt(ts.getAttribute(SEL.attrs.absoluteTimestamp), 10) || 0;
@@ -446,7 +693,9 @@ function getConversationName() {
 
 function createExtractionCache(container) {
   let entries = new WeakMap();
+  let changed = true;
   const invalidate = records => {
+    if (records.length) changed = true;
     for (const record of records) {
       const element = record.target.nodeType === 1 ? record.target : record.target.parentElement;
       const group = element?.closest(SEL.messageGroups);
@@ -458,6 +707,12 @@ function createExtractionCache(container) {
   const observer = new MutationObserver(invalidate);
   observer.observe(container, { subtree: true, childList: true, characterData: true, attributes: true });
   return {
+    changed() {
+      invalidate(observer.takeRecords());
+      const result = changed;
+      changed = false;
+      return result;
+    },
     read(group, date, parse) {
       invalidate(observer.takeRecords());
       const groupId = group.getAttribute?.(SEL?.attrs?.groupId) || '';
@@ -471,22 +726,28 @@ function createExtractionCache(container) {
   };
 }
 
-function extractMessages(cache = null) {
+function extractMessages(cache = null, leadingDate = '') {
   const results = [];
   const seen = new Set();
 
-  // Build date separator positions for date association
-  const dateSeps = [];
-  document.querySelectorAll(SEL.dateSeparator).forEach(el => {
-    const text = cleanText(el.textContent);
-    if (text) dateSeps.push({ text, top: el.getBoundingClientRect().top });
-  });
-
-  const groups = document.querySelectorAll(SEL.messageGroups);
-  for (const group of groups) {
-    const top = group.getBoundingClientRect().top;
-    const date = [...dateSeps].reverse().find(sep => sep.top <= top)?.text || dateSeps[0]?.text || '';
-    const msgs = cache ? cache.read(group, date, () => extractFromGroup(group, dateSeps)) : extractFromGroup(group, dateSeps);
+  // Document order gives each group's date without getBoundingClientRect, which forces layout of the whole list.
+  const nodes = [...document.querySelectorAll(`${SEL.dateSeparator}, ${SEL.messageGroups}`)];
+  const isSeparator = el => el.matches(SEL.dateSeparator);
+  let date = '';
+  // Groups above the first separator take that separator's date.
+  for (const el of nodes) {
+    if (!isSeparator(el)) continue;
+    date = cleanText(el.textContent);
+    if (date) break;
+  }
+  if (!date) date = leadingDate;
+  for (const group of nodes) {
+    if (isSeparator(group)) {
+      const text = cleanText(group.textContent);
+      if (text) date = text;
+      continue;
+    }
+    const msgs = cache ? cache.read(group, date, () => extractFromGroup(group, date)) : extractFromGroup(group, date);
     for (let i = 0; i < msgs.length; i++) {
       const msg = msgs[i];
       const hasMedia = msg.media && msg.media.length > 0;
@@ -519,7 +780,7 @@ function extractMessages(cache = null) {
   return results;
 }
 
-function extractFromGroup(group, dateSeps) {
+function extractFromGroup(group, date) {
   const results = [];
 
   // Sender
@@ -551,16 +812,6 @@ function extractFromGroup(group, dateSeps) {
     timestamp = cleanText(tsEl.textContent);
     const tsAttr = tsEl.getAttribute(SEL.attrs.absoluteTimestamp);
     if (tsAttr) absoluteTimestamp = parseInt(tsAttr, 10) || 0;
-  }
-
-  // Date association
-  let date = '';
-  if (dateSeps.length > 0) {
-    const groupTop = group.getBoundingClientRect().top;
-    for (let i = dateSeps.length - 1; i >= 0; i--) {
-      if (dateSeps[i].top <= groupTop) { date = dateSeps[i].text; break; }
-    }
-    if (!date) date = dateSeps[0].text;
   }
 
   // Message text elements
@@ -1070,17 +1321,256 @@ function isSameConversationUrl(a, b) {
   }
 }
 
+const retryHint = () => retainedScan ? ` — ${retainedScan.history.messages.length} scanned messages are kept; export again to retry without rescanning.` : '';
+
+// Long scans are only held in this tab's memory; a file on disk survives reloads and can be fed to gceExportFromMemory().
+let SCAN_BACKUP_MIN_MESSAGES = 1000;
+// Media per ZIP part; each part's base64 must stay well under the ~512 Mi-char JS string limit in the background.
+let ZIP_PART_BASE64_BUDGET = 150_000_000;
+async function saveScanBackup(messages, conversationName) {
+  try {
+    const base = `${(conversationName || 'chat').replace(/[^a-zA-Z0-9._-]+/g, '_')}_scan-backup_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}`;
+    const json = JSON.stringify(messages);
+    // JSZip is loaded next to this script by the manifest; a script injected on its own falls back to plain JSON.
+    const zipped = typeof JSZip === 'function';
+    const blob = zipped
+      ? await new JSZip().file(`${base}.json`, json).generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+      : new Blob([json], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${base}.${zipped ? 'zip' : 'json'}`;
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    console.log(`[Google Chat Exporter] saved scan backup ${a.download} (${messages.length} messages)`);
+  } catch (err) {
+    console.error('[Google Chat Exporter] could not save scan backup:', err);
+  }
+}
+
+// ── Segmented history scans ─────────────────────────────────
+// Chat slows down with every message loaded in a tab, so long scans hop to a fresh page opened at the
+// oldest collected message. Segments live in extension storage so they survive the navigation.
+const SEGMENT_JOB_KEY = 'gceSegmentJob';
+const SEGMENT_HOP_MAX_AGE_MS = 10 * 60 * 1000;
+// Jobs of closed or abandoned tabs are removed when a new segmented scan starts.
+const SEGMENT_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// A scanning page refreshes its job this often, so recovery can tell a crashed or closed tab from a live scan.
+let SEGMENT_HEARTBEAT_MS = 30000;
+const SEGMENT_JOB_ALIVE_MS = 5 * 60 * 1000;
+// A reopened segment that gains fewer messages than this before going idle is treated as stalled, not as the start.
+let SEGMENT_STALL_MESSAGES = 50;
+const SEGMENT_STALL_RETRIES = 10;
+const QUICK_STALL_BATCH_LIMIT = 3;
+const segmentKey = (jobId, n) => `gceSegment:${jobId}:${n}`;
+
+// Chat shows "<person> created this chat/space" above the first message; English UI only.
+// Only a text node that is exactly that notice counts, and never one inside a message, so a quoted phrase cannot end a scan.
+function conversationStartVisible() {
+  if (typeof document.createTreeWalker !== 'function') return false;
+  const walker = document.createTreeWalker(findScrollContainer() || document.body, 4 /* NodeFilter.SHOW_TEXT */);
+  const userContent = [SEL.messageText, SEL.messageBubble, SEL.botCardText].filter(Boolean).join(', ');
+  for (let i = 0; i < 400 && walker.nextNode(); i++) {
+    const node = walker.currentNode;
+    if (!/^[^.!?\n]{1,80}\bcreated this (chat|space|group|conversation)\.?$/i.test((node.nodeValue || '').trim())) continue;
+    if (userContent && node.parentElement?.closest?.(userContent)) continue;
+    return true;
+  }
+  return false;
+}
+
+// Returns { link, conversation } for the topmost (oldest) rendered message, or null.
+function oldestMessageLink() {
+  const group = document.querySelector(SEL.messageGroups);
+  if (!group) return null;
+  const attr = (name) => group.closest(`[${name}]`)?.getAttribute(name) || group.querySelector(`[${name}]`)?.getAttribute(name) || '';
+  const message = group.getAttribute(SEL.attrs.groupId) || attr('data-message-id');
+  const topic = attr('data-topic-id') || message;
+  if (!/^[\w-]+$/.test(message) || !/^[\w-]+$/.test(topic)) return null;
+  const page = topFrameUrl() || location.href;
+  // Keep the signed-in account, or Chat reopens the link under the default one.
+  let account = '';
+  try { const url = new URL(page); account = url.pathname.match(/\/u\/(\d+)/)?.[1] || url.searchParams.get('authuser') || ''; } catch { /* default account */ }
+  const query = account ? `?authuser=${encodeURIComponent(account)}` : '';
+  const app = page.match(/^(https:\/\/chat\.google\.com(\/u\/\d+)?\/app\/chat\/([\w-]+))/);
+  if (app) return { link: `${app[1]}/topic/${topic}/message/${message}${app[2] ? '' : query}`, conversation: app[3], message };
+  const synthetic = attr('data-group-synthetic-id').match(/^(space|dm)\/([\w-]+)$/);
+  if (!synthetic) return null;
+  const prefix = /^\d+$/.test(account) ? `/u/${account}` : '';
+  return { link: `https://chat.google.com${prefix}/${synthetic[1] === 'space' ? 'room' : 'dm'}/${synthetic[2]}/${topic}/${message}${prefix ? '' : query}`, conversation: synthetic[2], message };
+}
+
+function mergeMessages(...lists) {
+  const merged = new Map();
+  for (const list of lists) {
+    for (const msg of list) merged.set(msg._dedupKey || `${msg.sender}|${msg.absoluteTimestamp}|${(msg.text || '').slice(0, 80)}`, msg);
+  }
+  return [...merged.values()].sort((a, b) => (a.absoluteTimestamp || 0) - (b.absoluteTimestamp || 0));
+}
+
+// One job per tab, so segmented scans in two tabs never clear each other's segments.
+async function segmentJobKey() {
+  const resp = await chrome.runtime.sendMessage({ action: 'getTabId' });
+  if (!Number.isInteger(resp?.tabId)) throw new Error('Could not identify this tab for a segmented scan.');
+  return `${SEGMENT_JOB_KEY}:${resp.tabId}`;
+}
+
+async function readSegmentJob() {
+  const key = await segmentJobKey();
+  return (await chrome.storage.local.get(key))[key] || null;
+}
+
+async function writeSegmentJob(job) {
+  await chrome.storage.local.set({ [await segmentJobKey()]: job });
+}
+
+async function touchSegmentJob(id) {
+  const key = await segmentJobKey();
+  const job = (await chrome.storage.local.get(key))[key];
+  if (job?.id === id) await chrome.storage.local.set({ [key]: { ...job, alive: Date.now() } });
+}
+
+async function storedSegmentJobs() {
+  return Object.entries(await chrome.storage.local.get(null)).filter(([key]) => key.startsWith(`${SEGMENT_JOB_KEY}:`));
+}
+
+async function loadSegments(job) {
+  const keys = Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n));
+  const data = await chrome.storage.local.get(keys);
+  return keys.map(key => data[key] || []);
+}
+
+async function clearSegmentJob(job, key = null) {
+  if (!job) return;
+  key = key || await segmentJobKey();
+  // The tab may have started another segmented scan since; leave that job in place.
+  const current = (await chrome.storage.local.get(key))[key];
+  const keys = Array.from({ length: job.segments }, (_, n) => segmentKey(job.id, n));
+  await chrome.storage.local.remove(!current || current.id === job.id ? [key, ...keys] : keys);
+}
+
+async function hopToNextSegment(job, messages, target, options, retries = 0) {
+  if (!job) {
+    const own = await segmentJobKey();
+    for (const [key, old] of await storedSegmentJobs()) {
+      if (!(Date.now() - (old?.at || 0) < SEGMENT_JOB_MAX_AGE_MS)) await clearSegmentJob(old, key);
+      // The tab's previous job may hold a scan that was never exported; keep it recoverable under its own key.
+      else if (key === own && old?.id) await chrome.storage.local.set({ [`${SEGMENT_JOB_KEY}:recovery:${old.id}`]: old });
+    }
+    job = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, segments: 0, collected: 0, options, name: getConversationName(), startedAt: options.startedAt || Date.now() };
+  }
+  await chrome.storage.local.set({ [segmentKey(job.id, job.segments)]: messages });
+  const next = { ...job, segments: job.segments + 1, collected: job.collected + messages.length, retries,
+    stallRetries: (job.stallRetries || 0) + (retries ? 1 : 0),
+    link: target.link, conversation: target.conversation, message: target.message, state: 'hop', at: Date.now() };
+  await writeSegmentJob(next);
+  console.log(`[Google Chat Exporter] segment ${next.segments} stored (${messages.length} messages, ~${next.collected} total); reopening at`, target.link);
+  showProgress(`Segment ${next.segments} saved (~${next.collected} messages so far). Reopening Chat at the oldest message to continue...`, 15);
+  const resp = await chrome.runtime.sendMessage({ action: 'navigateTab', url: target.link });
+  if (!resp?.success) throw new Error(resp?.error || 'Could not reopen Chat at the oldest message.');
+}
+
+// Runs on page load: continues a segmented scan that navigated here.
+async function resumeSegmentJob() {
+  const job = await readSegmentJob();
+  if (!job || job.state !== 'hop' || Date.now() - job.at > SEGMENT_HOP_MAX_AGE_MS) return;
+  const onJobConversation = () => (topFrameUrl() || location.href).includes(job.conversation);
+  if (!onJobConversation()) return;
+  for (let i = 0; i < 60 && !document.querySelector(SEL.messageGroups); i++) await sleep(500);
+  if (!document.querySelector(SEL.messageGroups) || exportInProgress) return;
+  // Let Chat finish positioning on the linked message: wait until the rendered list stops growing.
+  let groups = -1;
+  for (let stable = 0, i = 0; stable < 3 && i < 12; i++) {
+    await sleep(500);
+    const now = document.querySelectorAll(SEL.messageGroups).length;
+    stable = now === groups ? stable + 1 : 0;
+    groups = now;
+  }
+  // Another conversation may have been opened while Chat rendered; leave the job untouched for recovery.
+  const current = await readSegmentJob();
+  if (!onJobConversation() || current?.id !== job.id || current.state !== 'hop' || exportInProgress) return;
+  await writeSegmentJob({ ...job, state: 'running' });
+  // Some workspaces do not open message links; scanning from wherever Chat landed would loop, so export what is stored.
+  if (job.message && !document.querySelector(`[${SEL.attrs.groupId}="${job.message}"], [data-message-id="${job.message}"]`)) {
+    console.warn('[Google Chat Exporter] Chat did not open the linked message; exporting the stored segments.');
+    const messages = mergeMessages(...await loadSegments(job));
+    const dateFrom = job.options?.dateFrom || '';
+    retainedScan = { url: location.href, dateFromTs: dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0, at: Date.now(), manual: true, segmentJob: job, name: job.name,
+      history: { messages, reason: 'limit', warning: 'Chat could not reopen at an older message, so the segmented scan ended early; older messages may be missing. Turn off segmented scanning and export again for the full history.' } };
+    return runExport({ ...job.options, sourceUrl: '', segmentJob: job });
+  }
+  console.log(`[Google Chat Exporter] resuming segmented scan at segment ${job.segments + 1}`);
+  return runExport({ ...job.options, sourceUrl: '', segmentJob: job });
+}
+
 // Resolves to 'done', 'empty', 'error', 'cancelled' or 'busy'.
-async function runExport({ format = 'txt', loadAll = true, includeMedia = true, dateFrom = '', incremental = false, sourceUrl = '', auto = false }) {
+// A single runtime message is capped at 64 MiB, so large exports are staged in the background in chunks.
+let MEDIA_CHUNK_CHARS = 16_000_000;
+async function sendPackage(format, payload) {
+  const stageId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const { messages, mediaFiles, ...rest } = payload;
+  const stage = async part => {
+    const resp = await chrome.runtime.sendMessage({ action: 'stagePackageParts', stageId, ...part });
+    if (resp && resp.success === false) throw new Error(resp.error || 'Could not stage export data.');
+  };
+  try {
+    for (let i = 0; i < messages.length; i += 500) await stage({ messages: messages.slice(i, i + 500) });
+    let batch = [];
+    let size = 0;
+    for (const file of mediaFiles) {
+      // A single large attachment would exceed the message limit on its own; the background joins its pieces.
+      if (file.base64.length > MEDIA_CHUNK_CHARS) {
+        if (batch.length) { await stage({ mediaFiles: batch }); batch = []; size = 0; }
+        const count = Math.ceil(file.base64.length / MEDIA_CHUNK_CHARS);
+        for (let index = 0; index < count; index++) {
+          await stage({ mediaPiece: { path: file.path, mimeType: file.mimeType, index, count,
+            base64: file.base64.slice(index * MEDIA_CHUNK_CHARS, (index + 1) * MEDIA_CHUNK_CHARS) } });
+        }
+        continue;
+      }
+      batch.push(file);
+      size += file.base64.length;
+      if (size >= 16_000_000) { await stage({ mediaFiles: batch }); batch = []; size = 0; }
+    }
+    if (batch.length) await stage({ mediaFiles: batch });
+    return await chrome.runtime.sendMessage({ action: 'packageAndDownload', format, stageId, payload: rest,
+      expected: { messages: messages.length, mediaFiles: mediaFiles.length } });
+  } catch (error) {
+    try { await chrome.runtime.sendMessage({ action: 'discardStagedPackage', stageId }); } catch { /* worker may be gone */ }
+    throw error;
+  }
+}
+
+// Resolves to 'complete', 'failed', or 'pending' when the browser is still saving after the wait.
+let DOWNLOAD_WAIT_MS = 60000;
+async function waitForDownloads(ids) {
+  if (!ids.length) return 'complete';
+  for (const started = Date.now(); ;) {
+    const states = (await chrome.runtime.sendMessage({ action: 'downloadStates', ids }).catch(() => null))?.states;
+    const values = states ? ids.map(id => states[id]) : [];
+    if (states && values.every(state => state === 'complete')) return 'complete';
+    if (values.some(state => state && state !== 'complete' && state !== 'in_progress')) return 'failed';
+    if (Date.now() - started >= DOWNLOAD_WAIT_MS) return 'pending';
+    await sleep(1000);
+  }
+}
+
+async function runExport({ format = 'txt', loadAll = true, includeMedia = true, dateFrom = '', incremental = false, sourceUrl = '', auto = false, segmentJob = null }) {
   if (exportInProgress) return 'busy';
   exportInProgress = true;
   const controller = new AbortController();
   exportController = controller;
   const { signal } = controller;
   let originalPosition = null;
+  // Every message this run scanned (all segments included); saved once as a backup when the run ends.
+  let scanned = null;
+  let hopped = false;
+  const runStartedAt = Date.now();
 
   try {
     await loadSelectors();
+    scanOptions = await readScanOptions();
 
     if (!isInChatFrame()) {
       showProgress('⚠️ Please open a Google Chat conversation first.', 0, 'error');
@@ -1093,6 +1583,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     showProgress('⏳ Preparing export...', 2);
 
     const initialUrl = typeof location !== 'undefined' ? location.href : '';
+    // Some app layouts keep the same address for every conversation, so the URL alone cannot match a kept scan.
+    const conversationKey = currentConversation()?.key || '';
     let scope = checkpointScopeFromPage(format, includeMedia, sourceUrl);
     let checkpointKey = scope ? `gceCheckpoint:${await hashCheckpointValue(scope)}` : '';
     let previous = incremental && checkpointKey ? (await chrome.storage.local.get(checkpointKey))[checkpointKey] : null;
@@ -1113,12 +1605,102 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     let history = { reason: 'visible-only', warning: 'Only currently rendered messages were requested.' };
     const dateFromTs = previous?.timestamp || (dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0);
 
-    if (loadAll) {
-      history = await scrollToLoadAll(
-        (text) => showProgress(text, 15),
-        dateFromTs,
-        signal
-      );
+    let reusedMedia = null;
+    let ownedJob = segmentJob;
+    // Recovered jobs may live under another tab's key or a recovery key; null means this tab's own key.
+    let ownedJobKey = null;
+    // Recovered scans keep the name of the conversation they came from, which may not be the open one.
+    let recoveredName = '';
+    if (loadAll && retainedScan && (retainedScan.manual || (scanOptions.retryReuse && conversationKey && retainedScan.conversation === conversationKey)) &&
+        retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
+      // A kept scan from a segmented run still owns that run's stored segments until an export succeeds.
+      ownedJob = segmentJob || retainedScan.segmentJob || null;
+      if (!segmentJob) ownedJobKey = retainedScan.segmentJobKey || null;
+      if (retainedScan.manual) recoveredName = retainedScan.name || '';
+      history = { ...retainedScan.history };
+      // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
+      history.warning = retainedScan.manual ? (history.warning || '')
+        : `${history.warning || ''} Reused the history scan from ${new Date(retainedScan.at).toLocaleString()}; later messages are not included.`.trim();
+      if (format === 'html' && includeMedia) reusedMedia = retainedScan.media || null;
+      // Strip packaged paths from copies: the kept messages must keep pairing with the kept media.
+      else history.messages = history.messages.map(m => m.media?.length ? { ...m, media: m.media.map(({ _localPath, ...x }) => x) } : m);
+      showProgress(`Reusing ${history.messages.length} messages from the previous unfinished export...`, 15);
+      messages = history.messages;
+      // The segments are cleared on success, so the backup must hold these messages itself.
+      if (segmentJob) scanned = messages;
+    } else if (loadAll) {
+      throwIfAborted(signal);
+      const scanStop = new AbortController();
+      const forwardCancel = () => scanStop.abort();
+      signal.addEventListener('abort', forwardCancel, { once: true });
+      historyScanStop = scanStop;
+      const segmentLimit = incremental || auto || !scanOptions.segmentedScan ? 0 : scanOptions.segmentSize;
+      const segmentNumber = (segmentJob?.segments || 0) + 1;
+      const before = segmentJob?.collected || 0;
+      // Earlier segments overlap this one by a few messages, so the total is approximate after the first hop.
+      const progress = (text, count) => showProgress(!segmentLimit && !segmentJob ? text
+        : count == null ? `Segment ${segmentNumber}: ${text}`
+        : `Segment ${segmentNumber}: loading history... ${count.toLocaleString()} messages in this segment, ${before ? '~' : ''}${(before + count).toLocaleString()} total`, 15);
+      // Each refresh finishes before the next starts, and the last one before the job is written again after the scan.
+      let touching = Promise.resolve();
+      const heartbeat = segmentJob && typeof setInterval === 'function'
+        ? setInterval(() => { touching = touching.then(() => touchSegmentJob(segmentJob.id)).catch(() => {}); }, SEGMENT_HEARTBEAT_MS) : null;
+      try {
+        history = await scrollToLoadAll(progress, dateFromTs, scanStop.signal, segmentLimit, !!segmentJob);
+      } finally {
+        if (heartbeat != null && typeof clearInterval === 'function') clearInterval(heartbeat);
+        await touching;
+        historyScanStop = null;
+        signal.removeEventListener('abort', forwardCancel);
+      }
+      scanned = history.messages;
+      throwIfAborted(signal);
+      if ((initialUrl && !isSameConversationUrl(initialUrl, location.href)) ||
+          (conversationKey && currentConversation()?.key !== conversationKey)) {
+        throw new Error('Conversation changed during export. Please retry.');
+      }
+      if (history.reason === 'segment') {
+        const target = oldestMessageLink();
+        if (target) {
+          await hopToNextSegment(segmentJob, history.messages, target, { format, includeMedia, dateFrom, loadAll: true, startedAt: runStartedAt });
+          hopped = true;
+          return 'segment';
+        }
+        history.reason = 'limit';
+        history.warning = 'Could not reopen Chat at an older message to continue the scan; older messages may be missing.';
+      }
+      // A reopened page sometimes never loads older history; reopen elsewhere rather than mistake it for the start.
+      if (segmentJob && history.reason === 'idle' && history.messages.length - (history.startCount || 0) < SEGMENT_STALL_MESSAGES &&
+          !conversationStartVisible()) {
+        const retries = segmentJob.retries || 0;
+        const target = oldestMessageLink();
+        if (target && retries < SEGMENT_STALL_RETRIES) {
+          console.warn(`[Google Chat Exporter] segment ${segmentJob.segments + 1} stalled after reopening; retrying at an older message (${retries + 1}/${SEGMENT_STALL_RETRIES})`);
+          await hopToNextSegment(segmentJob, history.messages, target, { format, includeMedia, dateFrom, loadAll: true }, retries + 1);
+          hopped = true;
+          return 'segment';
+        }
+        const oldest = history.messages.find(m => m.absoluteTimestamp)?.absoluteTimestamp;
+        history.reason = 'stalled';
+        history.warning = `⚠️ Export may be incomplete: Chat stopped loading older messages after ${retries} reopen attempts${oldest ? `, at ${new Date(oldest).toLocaleDateString()}` : ''}. If the conversation is older than that, turn off Segmented Scanning and export again.`;
+        console.warn(`[Google Chat Exporter] ${history.warning}`);
+      }
+      if (segmentJob) {
+        // Stored with the updated job before anything slow runs, so a crash or failure from here on can still recover it.
+        const finished = { ...segmentJob, segments: segmentJob.segments + 1, state: 'finished' };
+        await chrome.storage.local.set({ [segmentKey(segmentJob.id, segmentJob.segments)]: history.messages, [await segmentJobKey()]: finished });
+        segmentJob = finished;
+        ownedJob = segmentJob;
+        history.messages = mergeMessages(...await loadSegments(segmentJob));
+        scanned = history.messages;
+      }
+      history.scanStats = {
+        startedAt: new Date(segmentJob?.startedAt || runStartedAt).toISOString(),
+        seconds: Math.round((Date.now() - (segmentJob?.startedAt || runStartedAt)) / 1000),
+        segments: segmentJob ? segmentJob.segments : 1,
+        stallRetries: segmentJob?.stallRetries || 0
+      };
+      retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now(), segmentJob, name: getConversationName() } : null;
       messages = history.messages;
       await sleep(200, signal);
     }
@@ -1127,7 +1709,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     await sleep(100, signal);
 
     if (!messages) messages = extractMessages();
-    const conversationName = getConversationName() || 'Google Chat';
+    const conversationName = recoveredName || getConversationName() || 'Google Chat';
     if (incremental && !checkpointKey) {
       scope = await contentCheckpointScope(messages, conversationName, format, includeMedia, sourceUrl || initialUrl);
       if (!scope) throw new Error('Cannot create a safe conversation identity because the loaded messages have no timestamps.');
@@ -1142,6 +1724,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (previous) history.since = previous.timestamp;
 
     if (!messages || messages.length === 0) {
+      retainedScan = null;
       showProgress(previous ? `No new messages found since the previous export. ${history.warning || ''}` : 'No messages found. Try opening a conversation first.', 100, previous ? 'done' : 'error');
       setTimeout(hideProgress, 5000);
       exportInProgress = false;
@@ -1155,15 +1738,32 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     let mediaFiles = [];
     let mediaFailed = false;
 
-    if (format === 'html' && includeMedia) {
-      // Download all media
-      let totalMedia = 0;
-      messages.forEach(m => { totalMedia += (m.media || []).filter(x => x.url).length; });
-      const maxMedia = Math.max(totalMedia, 1);
+    // Kept media and saved ZIP parts belong to the exact messages they were made for; another selection starts over.
+    const selection = retainedScan?.selection;
+    if (reusedMedia && !(selection?.length === messages.length && selection.every((m, i) => m === messages[i]))) {
+      reusedMedia = null;
+      Object.assign(retainedScan, { media: null, partIds: [] });
+    }
+
+    // A cache with failed attachments is topped up: kept files stay, only the missing ones are fetched again.
+    const partialMedia = reusedMedia?.failed ? reusedMedia : null;
+    if (format === 'html' && includeMedia && reusedMedia && !partialMedia) {
+      mediaFiles = reusedMedia.files;
+      mediaFailed = reusedMedia.failed;
+      showProgress(`Reusing ${mediaFiles.length} downloaded attachments...`, 85);
+    } else if (format === 'html' && includeMedia) {
+      const keptPaths = new Set((partialMedia?.files || []).map(file => file.path));
+      // Paths from an earlier, abandoned download (or an imported backup) would point at files this ZIP lacks.
+      messages.forEach(m => (m.media || []).forEach(x => { if (!keptPaths.has(x._localPath)) delete x._localPath; }));
+      if (partialMedia) mediaFiles = [...partialMedia.files];
+      // Numbers follow every attachment, so a retried one gets the same path it would have had the first time.
       const jobs = [];
+      let number = 0;
       messages.forEach(msg => (msg.media || []).forEach(m => {
-        if (m.url) jobs.push({ m, number: jobs.length + 1 });
+        if (m.url && ++number && !m._localPath) jobs.push({ m, number });
       }));
+      const totalMedia = jobs.length;
+      const maxMedia = Math.max(totalMedia, 1);
       let nextJob = 0;
       let completed = 0;
 
@@ -1192,6 +1792,12 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       }));
       const failure = results.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
+      // Media downloads can take hours; keep them with the scan so a packaging failure can be retried.
+      if (retainedScan && retainedScan.history.messages === history.messages) {
+        retainedScan.media = { files: mediaFiles, failed: mediaFailed };
+        retainedScan.selection = messages;
+        retainedScan.partIds = [];
+      }
     }
 
     showProgress('📦 Packaging...', 88);
@@ -1199,7 +1805,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (initialUrl && !isSameConversationUrl(initialUrl, location.href)) {
       throw new Error('Conversation changed during export. Please retry.');
     }
-    const candidate = checkpointKey && loadAll && !mediaFailed && history.reason !== 'limit' && history.reason !== 'visible-only'
+    const candidate = checkpointKey && loadAll && !mediaFailed && !history.recovery && !['limit', 'visible-only', 'stopped', 'stalled', 'stuck'].includes(history.reason)
       ? await buildCheckpoint(messages) : null;
     if (mediaFailed) history.warning = `${history.warning || ''} Some attachments failed; the checkpoint will not advance.`.trim();
     if (incremental && !candidate && !mediaFailed) history.warning = `${history.warning || ''} No safe checkpoint was saved; the next export may repeat messages.`.trim();
@@ -1207,19 +1813,70 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     exportController = null;
 
     // Send to background for packaging & download
-    const resp = await chrome.runtime.sendMessage({
-      action: 'packageAndDownload',
-      format,
-      payload: { conversationName, messages, mediaFiles, exportDate, sourceUrl, history: { reason: history.reason, warning: history.warning, since: history.since }, checkpoint: candidate ? { key: checkpointKey, value: candidate } : null }
-    });
+    const historyInfo = { reason: history.reason, warning: history.warning, since: history.since };
+    const checkpoint = candidate ? { key: checkpointKey, value: candidate } : null;
+    const stats = buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt: segmentJob?.startedAt || runStartedAt });
+    let resp;
+    let savedIds = [];
+    if (format === 'html') {
+      // One request per ZIP part: a single long request gets the service worker killed (~5 min limit) and holds all media at once.
+      const chunks = [[]];
+      let size = 0;
+      for (const file of mediaFiles) {
+        if (size && size + file.base64.length > ZIP_PART_BASE64_BUDGET) { chunks.push([]); size = 0; }
+        chunks[chunks.length - 1].push(file);
+        size += file.base64.length;
+      }
+      const resumable = retainedScan?.media?.files === mediaFiles;
+      // Download IDs per saved part; a part whose download did not complete is packaged again.
+      const done = resumable ? [...(retainedScan.partIds || [])] : [];
+      const earlierIds = done.flatMap(ids => ids || []);
+      if (earlierIds.length) {
+        const states = (await chrome.runtime.sendMessage({ action: 'downloadStates', ids: earlierIds }).catch(() => null))?.states || {};
+        done.forEach((ids, i) => { if (ids && !ids.every(id => ['complete', 'in_progress'].includes(states[id]))) done[i] = undefined; });
+      }
+      const pending = chunks.map((_, i) => i).filter(i => !done[i]);
+      const filenames = [];
+      resp = pending.length ? null : { success: true };
+      for (const i of pending) {
+        showProgress(`📦 Packaging part ${i + 1}/${chunks.length}...`, 88 + Math.round((i / chunks.length) * 11));
+        const last = i === pending[pending.length - 1];
+        resp = await sendPackage(format, {
+          conversationName, messages: i === 0 ? messages : [], mediaFiles: chunks[i], exportDate, sourceUrl, stats,
+          history: historyInfo, checkpoint: last ? checkpoint : null, partDownloads: last ? done.flatMap(ids => ids || []) : [], part: { index: i, count: chunks.length }
+        });
+        if (!resp?.success) break;
+        filenames.push(resp.filename);
+        done[i] = resp.downloadIds || [];
+        if (resumable) retainedScan.partIds = [...done];
+      }
+      if (resp?.success) resp = { ...resp, filename: filenames.join(', '), parts: chunks.length };
+      savedIds = done.flatMap(ids => ids || []);
+    } else {
+      resp = await sendPackage(format, { conversationName, messages, mediaFiles, exportDate, sourceUrl, stats, history: historyInfo, checkpoint });
+      savedIds = resp?.downloadIds || [];
+    }
+      // A started download can still fail (e.g. disk full), so recovery data is only dropped once every file is saved.
+      const saved = resp?.success ? await waitForDownloads(savedIds) : '';
+      if (saved === 'failed') {
+        showProgress('❌ Export failed: the browser could not save every file.' + retryHint(), 0, 'error');
+        return 'error';
+      }
       if (resp && resp.success) {
+        const keep = saved !== 'complete';
+        if (!keep) {
+          retainedScan = null;
+          if (ownedJob) await clearSegmentJob(ownedJob, ownedJobKey).catch(() => {});
+        }
+        const parts = resp.parts > 1 ? ` Extract all ${resp.parts} parts into the same folder.` : '';
         const next = auto ? ' Auto-export: open the next channel.' : '';
-        showProgress(`Saved as ${resp.filename}. ${history.warning || ''} ${resp.checkpointWarning || ''}${next}`, 100, 'done');
-        if (!history.warning) setTimeout(hideProgress, 4000);
+        const pending = keep ? ' Some downloads have not finished; the scan is kept so you can export again if one fails.' : '';
+        showProgress(`Saved as ${resp.filename}.${parts} ${history.warning || ''} ${resp.checkpointWarning || ''}${pending}${next}`, 100, 'done');
+        if (!history.warning && !parts && !keep) setTimeout(hideProgress, 4000);
         return 'done';
       } else {
-        showProgress('❌ Export failed: ' + (resp?.error || 'Unknown error'), 0, 'error');
-        setTimeout(hideProgress, 6000);
+        console.error('[Google Chat Exporter] Packaging failed:', resp?.error || resp);
+        showProgress('❌ Export failed: ' + (resp?.error || 'Unknown error') + retryHint(), 0, 'error');
         return 'error';
       }
 
@@ -1231,15 +1888,126 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       setTimeout(hideProgress, 2500);
       return 'cancelled';
     }
-    console.error('[GCE] Export error:', err);
-    showProgress('❌ Export failed: ' + err.message, 0, 'error');
-    setTimeout(hideProgress, 6000);
+    console.error('[Google Chat Exporter] Export error:', err);
+    showProgress('❌ Export failed: ' + err.message + retryHint(), 0, 'error');
     return 'error';
   } finally {
     if (originalPosition) restoreScrollPosition(originalPosition.container, originalPosition.distance, originalPosition.anchor);
     exportInProgress = false;
     exportController = null;
+    if (!hopped && scanOptions.scanBackup) await saveRunBackup(scanned, segmentJob);
   }
+}
+
+// Packaged as export-info.json (HTML) or the TXT header so exports can be compared later.
+function buildExportStats({ conversationName, messages, exportDate, format, includeMedia, history, mediaFiles, mediaFailed, runStartedAt }) {
+  const times = messages.map(m => m.absoluteTimestamp).filter(Boolean);
+  const iso = ms => ms ? new Date(ms).toISOString() : null;
+  const first = times.reduce((a, b) => Math.min(a, b), Infinity);
+  const last = times.reduce((a, b) => Math.max(a, b), 0);
+  return {
+    extension: 'Google Chat Exporter',
+    extensionVersion: chrome.runtime.getManifest?.()?.version || '',
+    exportedAt: exportDate,
+    conversation: conversationName,
+    format: format === 'html' ? (includeMedia ? 'html+media' : 'html') : 'txt',
+    messages: messages.length,
+    firstMessageAt: iso(times.length ? first : 0),
+    lastMessageAt: iso(last),
+    scan: {
+      reason: history.reason,
+      warning: history.warning || '',
+      // Present only when this run (or the reused scan) scrolled history; null for page-only or console exports.
+      ...(history.scanStats || { startedAt: null, seconds: null, segments: 0, stallRetries: 0 })
+    },
+    exportSeconds: Math.round((Date.now() - runStartedAt) / 1000),
+    media: format === 'html' && includeMedia ? { files: mediaFiles.length, someFailed: !!mediaFailed } : null,
+    options: { ...scanOptions },
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : ''
+  };
+}
+
+// A segment page that fails before its own scan returns still has the earlier segments in storage.
+async function saveRunBackup(scanned, segmentJob) {
+  try {
+    const messages = segmentJob?.segments ? mergeMessages(...await loadSegments(segmentJob), scanned || []) : scanned;
+    if (messages?.length >= SCAN_BACKUP_MIN_MESSAGES) await saveScanBackup(messages, segmentJob?.name || getConversationName());
+  } catch (err) {
+    console.error('[Google Chat Exporter] could not save scan backup:', err);
+  }
+}
+
+// Console entry points (select the extension's content-script context in DevTools):
+//   gceExportFromMemory()          -> retained scan, else stored scan segments, else every message on the page
+//   gceExportFromMemory(messages)  -> an explicit array, e.g. parsed from a backup JSON
+//   gceExportBackupFile()          -> pick a backup .zip or .json file and export it
+//   gceSaveBackup()                -> download the messages gceExportFromMemory() would use as a backup JSON
+// Exports run the normal HTML + media export as a complete one, without scrolling.
+async function resolveMemoryMessages(messages = null) {
+  await loadSelectors();
+  if (messages) return { messages, source: 'argument' };
+  if (retainedScan?.history?.messages?.length) return { messages: retainedScan.history.messages, source: 'retained scan', name: retainedScan.name };
+  // A closed or crashed tab leaves its segments behind; recover the most recent job from any tab.
+  const ownKey = await segmentJobKey().catch(() => '');
+  const jobs = await storedSegmentJobs();
+  const [key, job] = jobs.find(([k]) => k === ownKey) || jobs.sort(([, a], [, b]) => (b?.at || 0) - (a?.at || 0))[0] || [];
+  if (job?.segments) {
+    // Another tab may still be scanning into this job; only a job no scan can still be using is cleared after export.
+    const idle = key === ownKey || job.state === 'finished' || Date.now() - Math.max(job.at || 0, job.alive || 0) > SEGMENT_JOB_ALIVE_MS;
+    return { messages: mergeMessages(...await loadSegments(job)), source: `${job.segments} stored segments of "${job.name || 'unknown'}"`, name: job.name,
+      job: idle ? job : null, jobKey: key };
+  }
+  return { messages: extractMessages(), source: 'page' };
+}
+
+async function gceExportFromMemory(messages = null, { format = 'html', includeMedia = true } = {}) {
+  const resolved = await resolveMemoryMessages(messages);
+  messages = resolved.messages;
+  console.log(`[Google Chat Exporter] exporting ${messages.length} messages from ${resolved.source} as ${format}${includeMedia ? ' + media' : ''}`);
+  // Re-running after a failed ZIP part continues with that part instead of repeating saved ones.
+  const kept = retainedScan?.history?.messages === messages ? retainedScan : null;
+  // Recovered messages may be partial or from another conversation, so they never advance a checkpoint.
+  const history = kept ? { ...kept.history, messages } : { messages, reason: 'recovery', warning: '' };
+  retainedScan = { url: location.href, dateFromTs: 0, history: { ...history, recovery: true }, at: Date.now(), manual: true, name: resolved.name || '',
+    media: kept?.media, selection: kept?.selection, partIds: kept?.partIds || [],
+    segmentJob: kept ? kept.segmentJob : resolved.job, segmentJobKey: kept ? kept.segmentJobKey : resolved.jobKey };
+  return runExport({ format, includeMedia, loadAll: true });
+}
+
+async function gceSaveBackup(messages = null) {
+  const resolved = await resolveMemoryMessages(messages);
+  await saveScanBackup(resolved.messages, resolved.name || getConversationName());
+  return `${resolved.messages.length} messages from ${resolved.source}`;
+}
+
+// The DevTools console counts as a user gesture, so the file picker may open from there.
+function gceExportBackupFile(options = {}) {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,.zip,application/json,application/zip';
+    input.onchange = async () => {
+      try {
+        const file = input.files[0];
+        let text;
+        if (/\.zip$/i.test(file.name || '')) {
+          if (typeof JSZip !== 'function') throw new Error('Cannot open ZIP backups here; extract the .json file and pick that instead.');
+          const entry = Object.values((await JSZip.loadAsync(file)).files).find(f => !f.dir && /\.json$/i.test(f.name));
+          if (!entry) throw new Error('The backup ZIP does not contain a .json file.');
+          text = await entry.async('string');
+        } else {
+          text = await file.text();
+        }
+        const messages = JSON.parse(text);
+        if (!Array.isArray(messages)) throw new Error('The backup file does not contain a message list.');
+        resolve(await gceExportFromMemory(messages, options));
+      } catch (err) {
+        console.error('[Google Chat Exporter] could not export the backup file:', err);
+        reject(err);
+      }
+    };
+    input.click();
+  });
 }
 
 // ── Export Mode (auto-export on channel switch) ─────────────
@@ -1399,6 +2167,8 @@ window.addEventListener('gce:startExport', async (e) => {
     console.log('[Google Chat Exporter] Content script active in chat frame');
     syncExportMode();
   }
+  // Chat may not have rendered yet at document_idle; resume waits for message groups itself.
+  resumeSegmentJob().catch(err => console.error('[Google Chat Exporter] could not resume segmented scan:', err));
   if (typeof setInterval === 'function') {
     setInterval(exportModeTick, 1000);
   }
