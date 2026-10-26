@@ -770,7 +770,13 @@ test('oldest-message link follows the app URL, falling back to the copied-link f
     link: 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
   c.location = { href: 'https://mail.google.com/chat/u/0/#chat/space/AAAAtnkdPQo' };
   assert.deepEqual({ ...c.oldestMessageLink() }, {
-    link: 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
+    link: 'https://chat.google.com/u/0/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs', conversation: 'AAAAtnkdPQo', message: 'dV5wI_76Cgs' });
+  c.location = { href: 'https://mail.google.com/chat/#chat/space/AAAAtnkdPQo' };
+  assert.equal(c.oldestMessageLink().link, 'https://chat.google.com/room/AAAAtnkdPQo/dV5wI_76Cgs/dV5wI_76Cgs');
+  c.location = { href: 'https://chat.google.com/app/chat/AAAAtnkdPQo?authuser=2' };
+  assert.equal(c.oldestMessageLink().link, 'https://chat.google.com/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs?authuser=2', 'the account survives the reopen');
+  c.location = { href: 'https://chat.google.com/u/1/app/chat/AAAAtnkdPQo' };
+  assert.equal(c.oldestMessageLink().link, 'https://chat.google.com/u/1/app/chat/AAAAtnkdPQo/topic/dV5wI_76Cgs/message/dV5wI_76Cgs');
 });
 
 test('console backup saves the kept scan and a picked backup file is exported', async () => {

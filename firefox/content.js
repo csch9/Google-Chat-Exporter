@@ -1377,11 +1377,17 @@ function oldestMessageLink() {
   const message = group.getAttribute(SEL.attrs.groupId) || attr('data-message-id');
   const topic = attr('data-topic-id') || message;
   if (!/^[\w-]+$/.test(message) || !/^[\w-]+$/.test(topic)) return null;
-  const app = (topFrameUrl() || location.href).match(/^(https:\/\/chat\.google\.com(?:\/u\/\d+)?\/app\/chat\/([\w-]+))/);
-  if (app) return { link: `${app[1]}/topic/${topic}/message/${message}`, conversation: app[2], message };
+  const page = topFrameUrl() || location.href;
+  // Keep the signed-in account, or Chat reopens the link under the default one.
+  let account = '';
+  try { const url = new URL(page); account = url.pathname.match(/\/u\/(\d+)/)?.[1] || url.searchParams.get('authuser') || ''; } catch { /* default account */ }
+  const query = account ? `?authuser=${encodeURIComponent(account)}` : '';
+  const app = page.match(/^(https:\/\/chat\.google\.com(\/u\/\d+)?\/app\/chat\/([\w-]+))/);
+  if (app) return { link: `${app[1]}/topic/${topic}/message/${message}${app[2] ? '' : query}`, conversation: app[3], message };
   const synthetic = attr('data-group-synthetic-id').match(/^(space|dm)\/([\w-]+)$/);
   if (!synthetic) return null;
-  return { link: `https://chat.google.com/${synthetic[1] === 'space' ? 'room' : 'dm'}/${synthetic[2]}/${topic}/${message}`, conversation: synthetic[2], message };
+  const prefix = /^\d+$/.test(account) ? `/u/${account}` : '';
+  return { link: `https://chat.google.com${prefix}/${synthetic[1] === 'space' ? 'room' : 'dm'}/${synthetic[2]}/${topic}/${message}${prefix ? '' : query}`, conversation: synthetic[2], message };
 }
 
 function mergeMessages(...lists) {
