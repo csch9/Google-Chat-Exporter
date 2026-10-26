@@ -1578,8 +1578,9 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
       history.warning = retainedScan.manual ? (history.warning || '')
         : `${history.warning || ''} Reused the history scan from ${new Date(retainedScan.at).toLocaleString()}; later messages are not included.`.trim();
-      if (format === 'html' && includeMedia && retainedScan.media) reusedMedia = retainedScan.media;
-      else history.messages.forEach(m => (m.media || []).forEach(x => { delete x._localPath; }));
+      if (format === 'html' && includeMedia) reusedMedia = retainedScan.media || null;
+      // Strip packaged paths from copies: the kept messages must keep pairing with the kept media.
+      else history.messages = history.messages.map(m => m.media?.length ? { ...m, media: m.media.map(({ _localPath, ...x }) => x) } : m);
       showProgress(`Reusing ${history.messages.length} messages from the previous unfinished export...`, 15);
       messages = history.messages;
       // The segments are cleared on success, so the backup must hold these messages itself.

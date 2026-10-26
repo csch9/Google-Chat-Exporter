@@ -654,6 +654,26 @@ test('the checkpoint waits for every ZIP part, and the console export resumes at
   assert.deepEqual(Array.from(lastPayload.partDownloads), [100, 101], 'the last part carries the earlier parts\' downloads');
 });
 
+test('a text retry after a failed HTML export keeps the kept messages linked to the kept media', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.scrollToLoadAll = async () => ({ messages: [{ text: 'pic', media: [{ url: 'https://example.com/p.png', name: 'p.png' }] }], reason: 'idle', warning: '' });
+  c.downloadMedia = async () => ({ success: true, base64: 'eA==', mimeType: 'image/png' });
+  let fail = true;
+  let packaged = null;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x' }; });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  assert.equal(packaged.messages[0].media[0]._localPath, undefined, 'the text export has no packaged paths');
+  fail = false;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.equal(packaged.messages[0].media[0]._localPath, packaged.mediaFiles[0].path);
+});
+
 test('a kept scan is not reused once another conversation is open at the same address', async () => {
   const c = loadContent();
   await c.loadSelectors();
