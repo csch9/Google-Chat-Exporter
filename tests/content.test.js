@@ -941,6 +941,20 @@ test('console export packages on-page messages with media as a complete export, 
   assert.equal(packaged.history.warning, '');
 });
 
+test('a cancel during preparation stops the export before the history scan starts', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.checkpointScopeFromPage = () => { vm.runInContext('exportController.abort()', c); return ''; };
+  let scanned = false;
+  c.scrollToLoadAll = async () => { scanned = true; return { messages: [], reason: 'idle', warning: '' }; };
+  assert.equal(await c.runExport({ format: 'txt' }), 'cancelled');
+  assert.equal(scanned, false);
+});
+
 test('an attachment larger than one message is staged in pieces and joined in order', async () => {
   const c = loadContent();
   vm.runInContext('MEDIA_CHUNK_CHARS = 4', c);

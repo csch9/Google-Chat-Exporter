@@ -1576,6 +1576,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       showProgress(`Reusing ${history.messages.length} messages from the previous unfinished export...`, 15);
       messages = history.messages;
     } else if (loadAll) {
+      throwIfAborted(signal);
       const scanStop = new AbortController();
       const forwardCancel = () => scanStop.abort();
       signal.addEventListener('abort', forwardCancel, { once: true });
