@@ -385,7 +385,7 @@
           <div class="option-sub">Scroll up to load all messages</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="load-all" checked>
+          <input type="checkbox" id="load-all" aria-label="Load Full History" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -406,7 +406,7 @@
           <div class="option-sub">First run establishes a baseline. Saves a new file.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="incremental">
+          <input type="checkbox" id="incremental" aria-label="New Since Last Export">
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -419,7 +419,7 @@
           <div class="option-sub">Download images, audio, files</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="include-media" checked>
+          <input type="checkbox" id="include-media" aria-label="Include Media" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -434,7 +434,7 @@
           <div class="option-sub">Exports each channel you open. Ends after 10 min without a switch.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="export-mode">
+          <input type="checkbox" id="export-mode" aria-label="Auto-Export on Open">
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -451,7 +451,7 @@
           <div class="option-warn">⚠️ The chat may look garbled during and after the export; reload the tab when it finishes.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="opt-prune-dom" checked>
+          <input type="checkbox" id="opt-prune-dom" aria-label="Free Memory While Scanning" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -464,7 +464,7 @@
           <div class="option-warn">⚠️ The tab navigates on its own and ends at an old message; reload the chat when the export finishes.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="opt-segmented-scan" checked>
+          <input type="checkbox" id="opt-segmented-scan" aria-label="Segmented Scanning" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -489,7 +489,7 @@
           <div class="option-sub">Sends a scroll-up event as soon as the top is reached, so Chat loads older messages sooner.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="opt-history-nudge" checked>
+          <input type="checkbox" id="opt-history-nudge" aria-label="Nudge History Loading" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -501,7 +501,7 @@
           <div class="option-sub">A failed export keeps its messages and media; exporting again skips the rescan.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="opt-retry-reuse" checked>
+          <input type="checkbox" id="opt-retry-reuse" aria-label="Reuse Scan After a Failure" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -513,7 +513,7 @@
           <div class="option-sub">Downloads one zipped JSON copy of scans with 1000+ messages when the export ends, whether it finished, failed or was cancelled.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="opt-scan-backup" checked>
+          <input type="checkbox" id="opt-scan-backup" aria-label="Save Scan Backup" checked>
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
@@ -525,7 +525,7 @@
           <div class="option-sub">Logs scan timing, load latency and memory to the page console.</div>
         </div>
         <label class="toggle">
-          <input type="checkbox" id="opt-diagnostics">
+          <input type="checkbox" id="opt-diagnostics" aria-label="Diagnostic Logging">
           <div class="toggle-track"></div>
           <div class="toggle-thumb"></div>
         </label>
