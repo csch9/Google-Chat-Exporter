@@ -480,8 +480,10 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
           });
           Object.assign(milestone, { next: milestone.next + 1000, at: Date.now(), batches: 0 });
         }
-        if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest))) lastProgressAt = Date.now();
-        else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = 'idle'; break; }
+        // Walking up through already-loaded history is progress too; small moves near the top can be Chat re-rendering.
+        const movedUp = !walkingBack && previousTop > container.clientHeight && container.scrollTop < previousTop - 1;
+        if (dedupMap.size > beforeCount || (oldest && (!prevOldest || oldest < prevOldest)) || movedUp) lastProgressAt = Date.now();
+        else if (Date.now() - lastProgressAt > NO_PROGRESS_LIMIT_MS) { reason = container.scrollTop <= container.clientHeight ? 'idle' : 'stuck'; break; }
         // Without a way to reopen Chat at the oldest message, keep scanning in this page.
         if (segmentLimit && dedupMap.size >= segmentLimit && oldestMessageLink()) { reason = 'segment'; break; }
 
@@ -538,6 +540,7 @@ async function scrollToLoadAll(onProgress, dateFromTs = 0, signal = null, segmen
     });
     const warning = reason === 'limit' ? 'History scan reached its safety limit; export may be incomplete.'
       : reason === 'stopped' ? 'History scan was stopped early; older messages are not included.'
+      : reason === 'stuck' ? 'History scan stopped making progress before reaching the top; older messages may be missing.'
       : '';
     onProgress && onProgress(warning ? `${dedupMap.size} messages collected. ${warning}` : `${dedupMap.size} messages collected.`);
 
@@ -1734,7 +1737,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     if (initialUrl && !isSameConversationUrl(initialUrl, location.href)) {
       throw new Error('Conversation changed during export. Please retry.');
     }
-    const candidate = checkpointKey && loadAll && !mediaFailed && !history.recovery && !['limit', 'visible-only', 'stopped', 'stalled'].includes(history.reason)
+    const candidate = checkpointKey && loadAll && !mediaFailed && !history.recovery && !['limit', 'visible-only', 'stopped', 'stalled', 'stuck'].includes(history.reason)
       ? await buildCheckpoint(messages) : null;
     if (mediaFailed) history.warning = `${history.warning || ''} Some attachments failed; the checkpoint will not advance.`.trim();
     if (incremental && !candidate && !mediaFailed) history.warning = `${history.warning || ''} No safe checkpoint was saved; the next export may repeat messages.`.trim();

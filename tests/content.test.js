@@ -1019,6 +1019,35 @@ test('a reopened page that barely loads anything gives up after fewer idle check
   assert.ok(await run(true) < await run(false));
 });
 
+test('walking up through already-loaded history keeps the scan alive; a scroll that stops moving ends incomplete', async () => {
+  const run = async ({ stuck }) => {
+    const c = loadContent();
+    await c.loadSelectors();
+    let now = 0;
+    c.Date = class extends Date { static now() { return now; } };
+    let top = 100000;
+    let minTop = top;
+    const container = { scrollHeight: 100400, clientHeight: 400,
+      get scrollTop() { return top; },
+      set scrollTop(value) { if (!stuck || value > top) top = value; minTop = Math.min(minTop, top); },
+      getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [] };
+    if (stuck) top = minTop = 50000;
+    c.findScrollContainer = () => container;
+    c.extractMessages = () => [{ _dedupKey: 'a', text: 'a', absoluteTimestamp: 1 }];
+    c.getOldestTimestamp = () => 1;
+    c.sleep = async () => {};
+    c.provokeHistoryLoad = async () => false;
+    c.waitForHistoryMutation = async () => { now += 5000; };
+    return { result: await c.scrollToLoadAll(null, 0, null, 0, false), minTop };
+  };
+  const walked = await run({ stuck: false });
+  assert.equal(walked.result.reason, 'idle');
+  assert.ok(walked.minTop <= 1, 'the scan reached the top');
+  const stuck = await run({ stuck: true });
+  assert.equal(stuck.result.reason, 'stuck');
+  assert.match(stuck.result.warning, /may be missing/);
+});
+
 test('exports carry stats about the version, message range and scan', async () => {
   const c = loadContent();
   await c.loadSelectors();
