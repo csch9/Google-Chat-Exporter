@@ -1123,6 +1123,33 @@ test('a console export of a wider selection downloads its media again instead of
   assert.equal(packaged.mediaFiles.length, 2, 'the attachment outside the filter is downloaded too');
 });
 
+test('a retry downloads only the attachments that failed before and keeps the rest', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  c.getConversationName = () => 'Fixture';
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  c.scrollToLoadAll = async () => ({ messages: ['a', 'b'].map(n => ({ text: n, media: [{ url: `https://example.com/${n}`, name: n }] })), reason: 'idle', warning: '' });
+  let offline = true;
+  const downloaded = [];
+  c.downloadMedia = async url => {
+    downloaded.push(url);
+    return offline && url.endsWith('/b') ? { success: false } : { success: true, base64: 'eA==', mimeType: 'image/png' };
+  };
+  let fail = true;
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.zip' }; });
+  assert.equal(await c.runExport({ format: 'html' }), 'error');
+  offline = false;
+  fail = false;
+  assert.equal(await c.runExport({ format: 'html' }), 'done');
+  assert.deepEqual(downloaded, ['https://example.com/a', 'https://example.com/b', 'https://example.com/b'], 'only the failed attachment is fetched again');
+  assert.deepEqual(Array.from(packaged.mediaFiles, f => f.path).sort(), ['media/1_a', 'media/2_b']);
+  assert.deepEqual(Array.from(packaged.messages, m => m.media[0]._localPath), ['media/1_a', 'media/2_b']);
+  assert.doesNotMatch(packaged.history.warning || '', /attachments failed/);
+});
+
 test('only Chat\'s own creation notice marks the start of a conversation', async () => {
   const c = loadContent();
   await c.loadSelectors();

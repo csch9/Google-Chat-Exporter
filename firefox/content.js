@@ -1721,21 +1721,25 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
       Object.assign(retainedScan, { media: null, partIds: [] });
     }
 
-    if (format === 'html' && includeMedia && reusedMedia) {
+    // A cache with failed attachments is topped up: kept files stay, only the missing ones are fetched again.
+    const partialMedia = reusedMedia?.failed ? reusedMedia : null;
+    if (format === 'html' && includeMedia && reusedMedia && !partialMedia) {
       mediaFiles = reusedMedia.files;
       mediaFailed = reusedMedia.failed;
       showProgress(`Reusing ${mediaFiles.length} downloaded attachments...`, 85);
     } else if (format === 'html' && includeMedia) {
+      const keptPaths = new Set((partialMedia?.files || []).map(file => file.path));
       // Paths from an earlier, abandoned download (or an imported backup) would point at files this ZIP lacks.
-      messages.forEach(m => (m.media || []).forEach(x => { delete x._localPath; }));
-      // Download all media
-      let totalMedia = 0;
-      messages.forEach(m => { totalMedia += (m.media || []).filter(x => x.url).length; });
-      const maxMedia = Math.max(totalMedia, 1);
+      messages.forEach(m => (m.media || []).forEach(x => { if (!keptPaths.has(x._localPath)) delete x._localPath; }));
+      if (partialMedia) mediaFiles = [...partialMedia.files];
+      // Numbers follow every attachment, so a retried one gets the same path it would have had the first time.
       const jobs = [];
+      let number = 0;
       messages.forEach(msg => (msg.media || []).forEach(m => {
-        if (m.url) jobs.push({ m, number: jobs.length + 1 });
+        if (m.url && ++number && !m._localPath) jobs.push({ m, number });
       }));
+      const totalMedia = jobs.length;
+      const maxMedia = Math.max(totalMedia, 1);
       let nextJob = 0;
       let completed = 0;
 
