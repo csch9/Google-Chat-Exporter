@@ -1525,6 +1525,8 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     showProgress('⏳ Preparing export...', 2);
 
     const initialUrl = typeof location !== 'undefined' ? location.href : '';
+    // Some app layouts keep the same address for every conversation, so the URL alone cannot match a kept scan.
+    const conversationKey = currentConversation()?.key || '';
     let scope = checkpointScopeFromPage(format, includeMedia, sourceUrl);
     let checkpointKey = scope ? `gceCheckpoint:${await hashCheckpointValue(scope)}` : '';
     let previous = incremental && checkpointKey ? (await chrome.storage.local.get(checkpointKey))[checkpointKey] : null;
@@ -1546,7 +1548,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
     const dateFromTs = previous?.timestamp || (dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : 0);
 
     let reusedMedia = null;
-    if (loadAll && retainedScan && (retainedScan.manual || scanOptions.retryReuse) &&
+    if (loadAll && retainedScan && (retainedScan.manual || (scanOptions.retryReuse && conversationKey && retainedScan.conversation === conversationKey)) &&
         retainedScan.url === initialUrl && retainedScan.dateFromTs === dateFromTs) {
       history = { ...retainedScan.history };
       // A rescan can take many hours, so reuse is never silently skipped; newer messages are flagged instead.
@@ -1613,7 +1615,7 @@ async function runExport({ format = 'txt', loadAll = true, includeMedia = true, 
         segments: segmentJob ? segmentJob.segments + 1 : 1,
         stallRetries: segmentJob?.stallRetries || 0
       };
-      retainedScan = scanOptions.retryReuse ? { url: initialUrl, dateFromTs, history: { ...history }, at: Date.now() } : null;
+      retainedScan = scanOptions.retryReuse ? { url: initialUrl, conversation: conversationKey, dateFromTs, history: { ...history }, at: Date.now() } : null;
       messages = history.messages;
       await sleep(200, signal);
     }

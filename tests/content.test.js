@@ -653,6 +653,28 @@ test('the checkpoint waits for every ZIP part, and the console export resumes at
   assert.deepEqual(parts, [0, 1, 2], 'parts saved before the failure are not repeated');
   assert.deepEqual(Array.from(lastPayload.partDownloads), [100, 101], 'the last part carries the earlier parts\' downloads');
 });
+
+test('a kept scan is not reused once another conversation is open at the same address', async () => {
+  const c = loadContent();
+  await c.loadSelectors();
+  c.isInChatFrame = () => true;
+  let name = 'Alpha';
+  c.getConversationName = () => name;
+  c.showProgress = () => {};
+  c.sleep = async () => {};
+  let scans = 0;
+  c.scrollToLoadAll = async () => { scans++; return { messages: [{ text: name }], reason: 'idle', warning: '' }; };
+  let fail = true;
+  let packaged;
+  c.chrome.runtime.sendMessage = packageRecorder(payload => { packaged = payload; return fail ? { success: false, error: 'boom' } : { success: true, filename: 'x.txt' }; });
+  assert.equal(await c.runExport({ format: 'txt' }), 'error');
+  fail = false;
+  name = 'Beta';
+  assert.equal(await c.runExport({ format: 'txt' }), 'done');
+  assert.equal(scans, 2, 'the other conversation is scanned');
+  assert.equal(packaged.messages[0].text, 'Beta');
+});
+
 test('long scans hop to a fresh page at the oldest message and the resumed page exports all segments', async () => {
   const store = {};
   const storage = {
