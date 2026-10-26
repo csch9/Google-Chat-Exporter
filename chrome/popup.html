@@ -30,7 +30,8 @@
       font-size: 13px;
       color: var(--text);
       background: var(--surface);
-      overflow: hidden;
+      /* Hiding only horizontal overflow lets the popup scroll once Advanced Scan Options is expanded. */
+      overflow-x: hidden;
       -webkit-font-smoothing: antialiased;
     }
 
